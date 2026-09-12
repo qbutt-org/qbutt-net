@@ -485,25 +485,28 @@ func (s *Server) expire() {
 	defer s.wg.Done()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
+	type expiry struct {
+		lease    *lease
+		deadline time.Time
+	}
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case now := <-ticker.C:
 			s.mu.Lock()
-			var expired []*lease
+			var expired []expiry
 			for _, owner := range s.sessions {
 				for _, current := range owner.leases {
 					if !now.Before(current.deadline) {
-						expired = append(expired, current)
+						expired = append(expired, expiry{lease: current, deadline: current.deadline})
 					}
 				}
 			}
 			s.mu.Unlock()
 			for _, current := range expired {
-				deadline := current.deadline
-				if current.closeIfExpired(&deadline) && (current.owner.send(Response{Revoked: current.info.Lease}) != nil) {
-					current.owner.close()
+				if current.lease.closeIfExpired(&current.deadline) && (current.lease.owner.send(Response{Revoked: current.lease.info.Lease}) != nil) {
+					current.lease.owner.close()
 				}
 			}
 		}
