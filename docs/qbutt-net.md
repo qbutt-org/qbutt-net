@@ -17,7 +17,17 @@ git diff --check
 
 The Bun fixture creates a temporary local upstream SOCKS/echo endpoint and profile, then exercises real TCP and UDP payloads, authentication failures, generation guards, import limits, external credential rejection, close, EOF, shutdown and invalid frames. An optional second argument after the executable selects the loopback interface. The fixture never reads a live profile or edits another client's settings. Linux builds are supported by the source but remain unverified here.
 
-The narrow [component workflow](../.github/workflows/qbutt-net.yml) pins the official Windows amd64 [Go toolchain module archive](https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip) by SHA-256. That archive was verified through Go's `sum.golang.org` database before its hash was pinned; [Go documents this authenticated toolchain distribution](https://go.dev/doc/toolchain). CI builds, vets and runs the same integration fixture on `main`, without publishing upstream products or dispatching to another repository.
+The optional [manual component workflow](../.github/workflows/qbutt-net.yml) pins the official Windows amd64 [Go toolchain module archive](https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip) by SHA-256. That archive was verified through Go's `sum.golang.org` database before its hash was pinned; [Go documents this authenticated toolchain distribution](https://go.dev/doc/toolchain). Releases are built and verified locally, then uploaded. The workflow runs only when the user explicitly requests a manual Actions run; pushes and pull requests do not trigger CI.
+
+## Release notices
+
+After a clean build from the current source commit, collect notices for the exact executable:
+
+```powershell
+bun scripts/collect-notices.ts ../qbutt-build/qbutt-net.exe ../qbutt-build/net-notices
+```
+
+An optional third argument supplies the pinned Go executable when it is not on `PATH`. Include both generated `qbutt-net-notices.json` and `qbutt-net-notices.txt` in the portable package, alongside the Go toolchain license. The collector reads binary build metadata and `go list -deps -json`, requires matching source revisions and module versions, follows `Module.Replace`, and records exact source archive URLs and checksums. It copies LICENSE/COPYING/NOTICE/PATENTS/COPYRIGHT texts found inside each linked module. Missing notices stop collection; no aggregate license classification is inferred. The main component is identified by its Git commit, so shallow builds do not require an upstream-derived module pseudo-version.
 
 ## Private control channel
 

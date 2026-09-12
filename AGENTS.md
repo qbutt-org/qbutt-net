@@ -17,9 +17,11 @@ Keep the final code simple across ownership boundaries. Review every diff, prese
 
 Do not write unit tests. The generated legal integration fixture is `scripts/qbutt-net-integration.ts`; run the documented Go build, vet and Bun integration commands. Use Bun/TypeScript for new tooling. Keep binaries, local profiles, subscription URLs and temporary artifacts outside tracked source.
 
+Before packaging a release, run `scripts/collect-notices.ts` against that exact clean-build binary and include its JSON inventory and original notice texts. It matches embedded dependencies to source modules and replacements; do not substitute a blanket dependency license claim or omit modules because their adapters are disabled at runtime. The Go toolchain license is packaged separately.
+
 The repository is public. Never commit or publish secrets, private profiles, dumps, keys or private dependency history; never print their values. Review the complete outgoing diff, stage explicit paths, and verify published commit and visibility through GitHub.
 
-`origin` is the standalone public `qbutt-org/qbutt-net` repository, whose only published branch is `main`. Keep the public upstream history and rebase qbutt changes onto deliberately pinned revisions of `MetaCubeX/mihomo`'s `Alpha` branch. Fetch only the required upstream branch/revision; never mirror upstream branches or tags into origin. `.github/workflows/qbutt-net.yml` owns this component's build, vet and integration checks; do not restore upstream publishing or cross-repository dispatch workflows.
+`origin` is the standalone public `qbutt-org/qbutt-net` repository, whose only published branch is `main`. Keep the public upstream history and rebase qbutt changes onto deliberately pinned revisions of `MetaCubeX/mihomo`'s `Alpha` branch. Fetch only the required upstream branch/revision; never mirror upstream branches or tags into origin. Build and verify releases locally, then upload the reviewed artifacts. The optional `.github/workflows/qbutt-net.yml` has only a manual trigger; never dispatch Actions without an explicit user request or add automatic triggers. Do not restore upstream publishing or cross-repository dispatch workflows.
 
 ## Maintaining instructions
 
