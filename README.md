@@ -1,3 +1,9 @@
+# qbutt-net
+
+Public Mihomo fork providing **qbutt-net**, the isolated transport child for [qbutt](https://github.com/qbutt-org/qbutt). Build, IPC, integration checks and current boundaries are documented in [docs/qbutt-net.md](docs/qbutt-net.md). The upstream project and its notices follow.
+
+The qbutt entrypoint supports selected standalone proxy adapters, including VLESS, ShadowQUIC and Hysteria2, through authenticated local SOCKS. It does not execute full profiles, providers, routing groups or TUN settings. TUIC is currently excluded pending deterministic pool shutdown. Local TCP/UDP integration is verified; protocol availability alone does not establish working Gecko, isolated DNS, public inbound or a particular remote service.
+
 <h1 align="center">
   <img src="Meta.png" alt="Meta Kennel" width="200">
   <br>Meta Kernel<br>
