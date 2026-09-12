@@ -144,6 +144,9 @@ func (b *Base) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 // DialOptions return []dialer.Option from struct
 func (b *Base) DialOptions() (opts []dialer.Option) {
+	if custom, ok := b.dialer.(interface{ Resolver() resolver.Resolver }); ok {
+		opts = append(opts, dialer.WithResolver(custom.Resolver()))
+	}
 	if b.iface != "" {
 		opts = append(opts, dialer.WithInterface(b.iface))
 	}
@@ -173,6 +176,15 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
 	}
 
 	return opts
+}
+
+// Auxiliary UDP/QUIC bootstrap must follow an API dialer's resolver as well as
+// its socket binding. Ordinary Mihomo adapters retain the configured resolver.
+func (b *Base) serverResolver() resolver.Resolver {
+	if custom, ok := b.dialer.(interface{ Resolver() resolver.Resolver }); ok {
+		return custom.Resolver()
+	}
+	return resolver.ProxyServerHostResolver
 }
 
 func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {

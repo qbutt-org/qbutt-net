@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	mihomoVMess "github.com/metacubex/mihomo/transport/vmess"
 
@@ -82,7 +83,7 @@ func NewRelayDialer(base C.Dialer, option *RelayOption) C.Dialer {
 	}
 }
 
-func (d *relayDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (d *relayDialer) DialContext(ctx context.Context, network, address string) (_ net.Conn, err error) {
 	if !strings.HasPrefix(network, "tcp") {
 		return nil, fmt.Errorf("gost relay only supports tcp dial, got %s", network)
 	}
@@ -90,6 +91,10 @@ func (d *relayDialer) DialContext(ctx context.Context, network, address string) 
 	conn, err := d.dialRelayServer(ctx, address)
 	if err != nil {
 		return nil, err
+	}
+	if ctx.Done() != nil {
+		done := N.SetupContextForConn(ctx, conn)
+		defer done(&err)
 	}
 
 	success := false
@@ -114,7 +119,7 @@ func (d *relayDialer) DialContext(ctx context.Context, network, address string) 
 	return conn, nil
 }
 
-func (d *relayDialer) ListenPacket(ctx context.Context, network, _ string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
+func (d *relayDialer) ListenPacket(ctx context.Context, network, _ string, rAddrPort netip.AddrPort) (_ net.PacketConn, err error) {
 	if !strings.HasPrefix(network, "udp") {
 		return nil, fmt.Errorf("gost relay only supports udp packet dial, got %s", network)
 	}
@@ -126,6 +131,10 @@ func (d *relayDialer) ListenPacket(ctx context.Context, network, _ string, rAddr
 	conn, err := d.dialRelayServer(ctx, raddr.String())
 	if err != nil {
 		return nil, err
+	}
+	if ctx.Done() != nil {
+		done := N.SetupContextForConn(ctx, conn)
+		defer done(&err)
 	}
 
 	success := false
@@ -153,7 +162,7 @@ func (d *relayDialer) ListenPacket(ctx context.Context, network, _ string, rAddr
 	}, nil
 }
 
-func (d *relayDialer) dialRelayServer(ctx context.Context, fallbackAddress string) (net.Conn, error) {
+func (d *relayDialer) dialRelayServer(ctx context.Context, fallbackAddress string) (_ net.Conn, err error) {
 	relayAddress := ""
 	if d.option.Server != "" || d.option.Port > 0 {
 		if d.option.Server == "" || d.option.Port <= 0 {
@@ -170,6 +179,10 @@ func (d *relayDialer) dialRelayServer(ctx context.Context, fallbackAddress strin
 	conn, err := d.base.DialContext(ctx, "tcp", relayAddress)
 	if err != nil {
 		return nil, err
+	}
+	if ctx.Done() != nil {
+		done := N.SetupContextForConn(ctx, conn)
+		defer done(&err)
 	}
 
 	if d.option.TLS {

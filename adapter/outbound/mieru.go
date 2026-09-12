@@ -57,13 +57,14 @@ func (pd mieruPacketDialer) ListenPacket(ctx context.Context, network, laddr, ra
 }
 
 type mieruDNSResolver struct {
-	prefer C.DNSPrefer
+	prefer   C.DNSPrefer
+	resolver resolver.Resolver
 }
 
 var _ mierucommon.DNSResolver = (*mieruDNSResolver)(nil)
 
 func (dr mieruDNSResolver) LookupIP(ctx context.Context, network, host string) (_ []net.IP, err error) {
-	ip, err := resolveIPWithResolver(ctx, host, dr.prefer, resolver.ProxyServerHostResolver)
+	ip, err := resolveIPWithResolver(ctx, host, dr.prefer, dr.resolver)
 	if err != nil {
 		return nil, fmt.Errorf("can't resolve ip: %w", err)
 	}
@@ -126,7 +127,7 @@ func (m *Mieru) ensureClientIsRunning() error {
 	}
 	config.Dialer = m.dialer
 	config.PacketDialer = mieruPacketDialer{Dialer: m.dialer}
-	config.Resolver = mieruDNSResolver{prefer: m.prefer}
+	config.Resolver = mieruDNSResolver{prefer: m.prefer, resolver: m.serverResolver()}
 	if err := m.client.Store(config); err != nil {
 		return err
 	}

@@ -234,7 +234,7 @@ func (ss *ShadowSocks) DialContext(ctx context.Context, metadata *C.Metadata) (_
 }
 
 func (ss *ShadowSocks) listenPacketContext(ctx context.Context) (net.PacketConn, net.Addr, error) {
-	addr, err := resolveUDPAddr(ctx, "udp", ss.addr, ss.prefer)
+	addr, err := resolveUDPAddr(ctx, ss.addr, ss.prefer, ss.serverResolver())
 	if err != nil {
 		return nil, nil, err
 	}

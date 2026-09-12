@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/metacubex/mihomo/common/structure"
 	"gopkg.in/yaml.v3"
 )
 
@@ -85,15 +86,22 @@ func selectedProxy(req request) (map[string]any, *controlError) {
 		if !inlineCredentials(proxy, proxy["type"] == "masque") {
 			return nil, failure("external_credentials_not_supported")
 		}
+		if !pathDNSOptions(proxy) {
+			return nil, failure("auxiliary_dns_not_supported")
+		}
 		for key, value := range proxy {
 			// Match the upstream decoder's case-insensitive underscore aliases.
 			switch strings.ToLower(strings.ReplaceAll(key, "_", "-")) {
+			case "protocol", "obfs-protocol":
+				if proxy["type"] == "hysteria" && value == "faketcp" {
+					return nil, failure("unbound_transport_not_supported")
+				}
 			case "dialer-proxy":
 				if value != "" {
 					return nil, failure("proxy_chain_not_supported")
 				}
 				delete(proxy, key)
-			case "interface-name", "routing-mark":
+			case "interface-name", "routing-mark", "dns", "remote-dns-resolve":
 				delete(proxy, key)
 			}
 		}
@@ -103,6 +111,50 @@ func selectedProxy(req request) (map[string]any, *controlError) {
 		return proxy, nil
 	}
 	return nil, failure("proxy_not_found")
+}
+
+// Dynamic ECH and realm discovery have their own global/auxiliary DNS paths.
+// Inline ECH remains usable; the selected adapter cannot import a second DNS
+// policy or auxiliary TLS traffic generator behind the parent's path contract.
+func pathDNSOptions(value any) bool {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, field := range value {
+			normalized := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+			switch normalized {
+			case "ech-opts", "realm-opts":
+				mapping, ok := field.(map[string]any)
+				if !ok {
+					return false
+				}
+				var option struct {
+					Enable bool   `proxy:"enable"`
+					Config string `proxy:"config"`
+				}
+				decoder := structure.NewDecoder(structure.Option{TagName: "proxy", WeaklyTypedInput: true, KeyReplacer: structure.DefaultKeyReplacer})
+				if decoder.Decode(mapping, &option) != nil {
+					return false
+				}
+				if option.Enable && (normalized == "realm-opts" || option.Config == "") {
+					return false
+				}
+			case "tlsmirror-opts":
+				if mapping, ok := field.(map[string]any); !ok || len(mapping) != 0 {
+					return false
+				}
+			}
+			if !pathDNSOptions(field) {
+				return false
+			}
+		}
+	case []any:
+		for _, field := range value {
+			if !pathDNSOptions(field) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Mihomo accepts certificate/private-key filenames and starts file watchers.

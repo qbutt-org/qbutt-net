@@ -12,10 +12,13 @@ $env:GOTOOLCHAIN = 'local'
 go build -trimpath -o ../qbutt-build/qbutt-net.exe ./cmd/qbutt-net
 go vet ./cmd/qbutt-net
 bun scripts/qbutt-net-integration.ts ../qbutt-build/qbutt-net.exe
+bun scripts/qbutt-net-dns-integration.ts ../qbutt-build/qbutt-net.exe
 git diff --check
 ```
 
 The Bun fixture creates a temporary local upstream SOCKS/echo endpoint and profile, then exercises real TCP and UDP payloads, authentication failures, generation guards, import limits, external credential rejection, close, EOF, shutdown and invalid frames. An optional second argument after the executable selects the loopback interface. The fixture never reads a live profile or edits another client's settings. Linux builds are supported by the source but remain unverified here.
+
+The DNS fixture uses two local TLS SOCKS adapters and a separate bootstrap DNS endpoint. It verifies independent A/AAAA results for the same name, preserved TLS server names, numeric IPv4/IPv6 destinations in real TCP/UDP relays, CNAME traversal, TTL caching and expiry, malformed responses, close cancellation and generation isolation. A local GOST endpoint that accepts TCP without answering verifies handshake timeout and pending TCP/UDP close. The fixture also verifies that `localhost` uses the selected path and that an imported rogue DNS endpoint receives no connections. It does not modify the machine's DNS settings or claim to intercept an actual system resolver. Public resolver reachability, physical-interface routing and external IPv6 connectivity need separate live probes.
 
 The optional [manual component workflow](../.github/workflows/qbutt-net.yml) pins the official Windows amd64 [Go toolchain module archive](https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip) by SHA-256. That archive was verified through Go's `sum.golang.org` database before its hash was pinned; [Go documents this authenticated toolchain distribution](https://go.dev/doc/toolchain). Releases are built and verified locally, then uploaded. The workflow runs only when the user explicitly requests a manual Actions run; pushes and pull requests do not trigger CI.
 
@@ -36,8 +39,8 @@ Launch `qbutt-net.exe --stdio` with private inherited stdin/stdout pipes, for ex
 Each UTF-8 JSON object ends with LF. Maximum frame size including LF is 65,536 bytes. Malformed JSON and oversized frames close every path and exit nonzero. Requests execute in order; `id` and `generation` are positive integers at most 2^53−1. Responses echo the request ID. `hello` must precede every other method. Version mismatch is explicit; no version fallback is attempted.
 
 ```json
-{"v":1,"id":1,"method":"hello"}
-{"v":1,"id":1,"result":{"protocol":1,"name":"qbutt-net","upstreamRevision":"d3ec342d441b086ec4318332f59dd05d8a2b5697","maxFrameBytes":65536}}
+{"v":2,"id":1,"method":"hello"}
+{"v":2,"id":1,"result":{"protocol":2,"name":"qbutt-net","upstreamRevision":"d3ec342d441b086ec4318332f59dd05d8a2b5697","maxFrameBytes":65536}}
 ```
 
 Requests use these fields at the top level:
@@ -46,7 +49,8 @@ Requests use these fields at the top level:
 |---|---|---|
 | `hello` | none | Protocol/build base and frame limit |
 | `list` | `configPath` | `proxies: [{name,type}]` |
-| `open` | `configPath`, `proxyName`, `pathId`, `generation`, `interfaceName` | Bound listener, private credentials and source capabilities |
+| `open` | `configPath`, `proxyName`, `pathId`, `generation`, `interfaceName`, `dns` | Bound listener, private credentials and source capabilities |
+| `resolve` | `pathId`, `generation`, `host`, `family` | `addresses: [numeric IP]`, at most 64 |
 | `close` | `pathId`, `generation` | `{}` after tracked I/O stops |
 | `shutdown` | none | `{}`, then process exit |
 
@@ -56,21 +60,35 @@ Requests use these fields at the top level:
 
 The parent supplies the physical interface by the Go/Windows friendly interface name, such as the Qt `humanReadableName()`. It must exist and be up at open time. The supplied value replaces every imported interface override; imported routing marks are discarded. Adapter connection errors remain errors, without a direct fallback.
 
+Protocol 2 requires an explicit parent-owned DNS policy on every open; protocol 1 is rejected. A basic configurable public-resolver default can be supplied by the desktop client:
+
+```json
+{"dns":{"server":"1.1.1.1:53","bootstrapServer":"1.1.1.1:53","family":"dual"}}
+```
+
+Both endpoints must be numeric IP:port addresses. Torrent A/AAAA queries use DNS-over-TCP through the selected adapter to `server`. `family` is `ipv4`, `ipv6` or `dual` and constrains torrent resolution, including numeric payload destinations. Bootstrap independently permits both address families and uses DNS-over-TCP to `bootstrapServer`, physically bound to `interfaceName` with fallback binding disabled. Only the selected proxy's server hostname (and DNS CNAMEs needed to resolve it) may use bootstrap. The original server field is retained for TLS/SNI. Numeric proxy servers need no bootstrap query. A SOCKS server's domain-form UDP relay response is rejected; unspecified UDP relay IPs resolve the original server through its bootstrap resolver.
+
+Both TCP destinations and every UDP datagram are resolved to numeric metadata before the adapter sees them. Each generation owns a 128-entry positive DNS cache, bounded by the received TTL and 60 seconds; TTL zero is never reused. A/AAAA results are limited to 64 addresses, CNAME traversal to eight names, and each resolution to five seconds. There is no OS resolver, hosts-file or subscription DNS fallback. The child's process-global resolver entrypoints are closed defaults; active resolver objects are passed only through their path's dialer. DNS connections are tracked and cancelled on path close. An in-flight serial `resolve` can delay the next control operation or EOF processing by at most the five-second resolution bound.
+
+Dynamic ECH discovery, Hysteria2 realm discovery and TLSMirror auxiliary traffic options are rejected explicitly; inline ECH configuration remains supported. Hysteria's raw `faketcp` transport is rejected because it bypasses the physical dialer. Adapter-local `dns` and `remote-dns-resolve` values are discarded in favor of the parent policy. Existing ordinary Mihomo resolver behavior is preserved outside qbutt-net.
+
 An `open` result has this shape (credentials below are illustrative):
 
 ```json
-{"v":1,"id":3,"result":{"pathId":"path-1","generation":1,"interfaceName":"Ethernet","host":"127.0.0.1","port":50000,"socksUsername":"example","socksPassword":"example","capabilities":{"tcp":"supported","udp":"source-supported","dns":"system-unverified","publicTcp":"unknown","publicUdp":"unknown","measurement":"not-probed"}}}
+{"v":2,"id":3,"result":{"pathId":"path-1","generation":1,"interfaceName":"Ethernet","host":"127.0.0.1","port":50000,"socksUsername":"example","socksPassword":"example","capabilities":{"tcp":"supported","udp":"source-supported","dns":"path-tcp","publicTcp":"unknown","publicUdp":"unknown","measurement":"not-probed"}}}
 ```
 
-UDP is `source-supported` or `source-unsupported` according to the adapter's `SupportUDP()`. TCP availability describes the source adapter API. DNS is reported as `system-unverified`. Neither means a successful connection or verified egress. No health state, public port, latency or loss is invented. The parent detects child process failure; no asynchronous health event exists in v1.
+UDP is `source-supported` or `source-unsupported` according to the adapter's `SupportUDP()`. TCP availability describes the source adapter API. DNS `path-tcp` describes the configured resolver ownership and transport. These fields do not mean a successful connection or verified egress. No health state, public port, latency or loss is invented. The parent detects child process failure; no asynchronous health event exists.
 
 Failures use fixed codes and no raw adapter/parser data:
 
 ```json
-{"v":1,"id":4,"error":{"code":"generation_mismatch","message":"generation_mismatch"}}
+{"v":2,"id":4,"error":{"code":"generation_mismatch","message":"generation_mismatch"}}
 ```
 
 Codes include `protocol_mismatch`, `hello_required`, `invalid_request_id`, `unknown_method`, `absolute_config_path_required`, `config_unreadable`, `config_not_regular`, `config_limit`, `invalid_config`, `no_proxies`, `proxy_limit`, `invalid_proxy_identity`, `proxy_not_found`, `unsupported_proxy_type`, `proxy_chain_not_supported`, `external_credentials_not_supported`, `invalid_path`, `path_exists`, `path_not_found`, `path_limit`, `generation_mismatch`, `interface_required`, `interface_unavailable`, `adapter_rejected`, `listener_failed`, `credentials_failed` and `response_limit`.
+
+DNS-specific failures are `dns_policy_required`, `invalid_dns_policy`, `invalid_dns_family`, `path_dns_failed`, `auxiliary_dns_not_supported` and `unbound_transport_not_supported`. None includes the hostname, subscription URL or upstream error text.
 
 ## Payload and lifecycle
 
@@ -80,4 +98,4 @@ At most eight paths and 512 tracked socket handles per path exist. Handshakes an
 
 ## Current boundaries
 
-This is one explicit outbound proxy path. Public inbound, independent remote egress, transport-specific live throughput, UDP mapping stability and full DNS/discovery policy are not established by local fixture success. Existing system DNS/bootstrap behavior is retained. In particular, physical interface binding does not prove DNS isolation or bypass of another system TUN. Do not label this prototype “Tunnels only”. TUIC is currently rejected because the pinned upstream adapter does not implement deterministic close of its QUIC pool; enabling it requires fixing and probing that lifecycle first.
+This is one explicit outbound proxy path. Public inbound, independent remote egress, transport-specific live throughput, UDP mapping stability and application-wide discovery policy are not established by local fixture success. In particular, physical interface binding does not prove bypass of another system TUN. Do not label this prototype “Tunnels only”. TUIC is currently rejected because the pinned upstream adapter does not implement deterministic close of its QUIC pool; enabling it requires fixing and probing that lifecycle first.

@@ -10,24 +10,28 @@ import (
 	"os"
 
 	mierulog "github.com/enfein/mieru/v3/pkg/log"
+	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/sirupsen/logrus"
 )
 
 const (
-	protocolVersion  = 1
+	protocolVersion  = 2
 	maxFrameBytes    = 65536
 	upstreamRevision = "d3ec342d441b086ec4318332f59dd05d8a2b5697"
 )
 
 type request struct {
-	Version       int    `json:"v"`
-	ID            uint64 `json:"id"`
-	Method        string `json:"method"`
-	ConfigPath    string `json:"configPath"`
-	ProxyName     string `json:"proxyName"`
-	PathID        string `json:"pathId"`
-	Generation    uint64 `json:"generation"`
-	InterfaceName string `json:"interfaceName"`
+	Version       int        `json:"v"`
+	ID            uint64     `json:"id"`
+	Method        string     `json:"method"`
+	ConfigPath    string     `json:"configPath"`
+	ProxyName     string     `json:"proxyName"`
+	PathID        string     `json:"pathId"`
+	Generation    uint64     `json:"generation"`
+	InterfaceName string     `json:"interfaceName"`
+	DNS           *dnsPolicy `json:"dns"`
+	Host          string     `json:"host"`
+	Family        string     `json:"family"`
 }
 
 type response struct {
@@ -53,6 +57,14 @@ func main() {
 	logrus.SetOutput(io.Discard)
 	stdlog.SetOutput(io.Discard)
 	mierulog.SetOutput(io.Discard)
+	// No adapter in this child may fall through to process/system DNS. Actual
+	// resolvers are passed per path; globals are only a closed default boundary.
+	blocked := &pathResolver{}
+	resolver.DefaultResolver = blocked
+	resolver.ProxyServerHostResolver = blocked
+	resolver.DirectHostResolver = blocked
+	resolver.SystemResolver = blocked
+	resolver.DisableIPv6 = false
 	if len(os.Args) != 2 || os.Args[1] != "--stdio" {
 		fmt.Fprintln(os.Stderr, "qbutt-net requires --stdio and private parent pipes")
 		os.Exit(2)
@@ -120,6 +132,26 @@ func run() error {
 			}
 			paths[req.PathID] = p
 			reply.Result = p.endpoint(req)
+		case req.Method == "resolve":
+			p, exists := paths[req.PathID]
+			if !exists {
+				reply.Error = failure("path_not_found")
+				break
+			}
+			if p.generation != req.Generation {
+				reply.Error = failure("generation_mismatch")
+				break
+			}
+			if !validFamily(req.Family) {
+				reply.Error = failure("invalid_dns_family")
+				break
+			}
+			addresses, err := p.resolver.lookup(p.ctx, req.Host, req.Family)
+			if err != nil {
+				reply.Error = failure("path_dns_failed")
+				break
+			}
+			reply.Result = map[string]any{"addresses": addresses}
 		case req.Method == "close":
 			p, exists := paths[req.PathID]
 			if !exists {

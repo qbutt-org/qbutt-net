@@ -45,13 +45,13 @@ func resolveIPWithResolver(ctx context.Context, host string, prefer C.DNSPrefer,
 	}
 }
 
-func resolveUDPAddr(ctx context.Context, network, address string, prefer C.DNSPrefer) (*net.UDPAddr, error) {
+func resolveUDPAddr(ctx context.Context, address string, prefer C.DNSPrefer, r resolver.Resolver) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
 
-	ip, err := resolveIPWithResolver(ctx, host, prefer, resolver.ProxyServerHostResolver)
+	ip, err := resolveIPWithResolver(ctx, host, prefer, r)
 
 	if err != nil {
 		return nil, err

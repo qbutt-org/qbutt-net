@@ -84,7 +84,7 @@ func (ssr *ShadowSocksR) ListenPacketContext(ctx context.Context, metadata *C.Me
 	if err := ssr.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	addr, err := resolveUDPAddr(ctx, "udp", ssr.addr, ssr.prefer)
+	addr, err := resolveUDPAddr(ctx, ssr.addr, ssr.prefer, ssr.serverResolver())
 	if err != nil {
 		return nil, err
 	}

@@ -7,17 +7,20 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/socks5"
 )
 
 type path struct {
 	proxy       C.Proxy
+	resolver    *pathResolver
 	listener    net.Listener
 	generation  uint64
 	username    string
@@ -42,7 +45,45 @@ func openPath(req request) (*path, *controlError) {
 	if importErr != nil {
 		return nil, importErr
 	}
-	proxy, err := adapter.ParseProxy(mapping)
+	if req.DNS == nil {
+		return nil, failure("dns_policy_required")
+	}
+	dnsAddress, dnsErr := dnsServer(req.DNS.Server)
+	bootstrapAddress, bootstrapErr := dnsServer(req.DNS.BootstrapServer)
+	if dnsErr != nil || bootstrapErr != nil || !validFamily(req.DNS.Family) {
+		return nil, failure("invalid_dns_policy")
+	}
+	serverHost, ok := mapping["server"].(string)
+	if !ok {
+		return nil, failure("adapter_rejected")
+	}
+	// A numeric server permits no bootstrap hostname (dnsName rejects root).
+	serverName := "."
+	if _, err := netip.ParseAddr(serverHost); err != nil {
+		serverName, err = dnsName(serverHost)
+		if err != nil {
+			return nil, failure("adapter_rejected")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &path{generation: req.Generation, ctx: ctx, cancel: cancel, connections: make(map[io.Closer]struct{})}
+	opened := false
+	defer func() {
+		if !opened {
+			cancel()
+		}
+	}()
+	physical := dialer.NewDialer(dialer.WithInterface(req.InterfaceName), dialer.WithResolver(&pathResolver{}), dialer.WithFallbackBind(false))
+	bootstrap := &pathResolver{owner: p, server: bootstrapAddress, onlyHost: serverName, family: "dual",
+		dial: func(ctx context.Context, address string) (net.Conn, error) {
+			network := "tcp4"
+			if bootstrapAddress.Addr().Is6() {
+				network = "tcp6"
+			}
+			return physical.DialContext(ctx, network, address)
+		}}
+	bound := serverDialer{Dialer: dialer.NewDialer(dialer.WithInterface(req.InterfaceName), dialer.WithResolver(bootstrap), dialer.WithFallbackBind(false)), bootstrap: bootstrap}
+	proxy, err := adapter.ParseProxy(mapping, adapter.WithDialerForAPI(bound))
 	if err != nil {
 		return nil, failure("adapter_rejected")
 	}
@@ -57,8 +98,19 @@ func openPath(req request) (*path, *controlError) {
 		proxy.Close()
 		return nil, failure("credentials_failed")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &path{proxy: proxy, listener: listener, generation: req.Generation, username: hex.EncodeToString(secret[:8]), password: hex.EncodeToString(secret[8:]), ctx: ctx, cancel: cancel, connections: make(map[io.Closer]struct{})}
+	p.proxy = proxy
+	p.listener = listener
+	p.username = hex.EncodeToString(secret[:8])
+	p.password = hex.EncodeToString(secret[8:])
+	p.resolver = &pathResolver{owner: p, server: dnsAddress, family: req.DNS.Family,
+		dial: func(ctx context.Context, address string) (net.Conn, error) {
+			metadata := &C.Metadata{NetWork: C.TCP, Type: C.SOCKS5}
+			if err := metadata.SetRemoteAddress(address); err != nil {
+				return nil, err
+			}
+			return p.proxy.DialContext(ctx, metadata)
+		}}
+	opened = true
 	p.wg.Add(1)
 	go p.accept()
 	return p, nil
@@ -80,7 +132,7 @@ func (p *path) endpoint(req request) map[string]any {
 		"capabilities": map[string]string{
 			"tcp":         "supported",
 			"udp":         udp,
-			"dns":         "system-unverified",
+			"dns":         "path-tcp",
 			"publicTcp":   "unknown",
 			"publicUdp":   "unknown",
 			"measurement": "not-probed",
@@ -193,6 +245,11 @@ func (p *path) serve(c net.Conn) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
+		if err := p.resolveMetadata(ctx, metadata); err != nil {
+			cancel()
+			replySOCKS(c, byte(socks5.ErrHostUnreachable), nil)
+			return
+		}
 		remote, err := p.proxy.DialContext(ctx, metadata)
 		cancel()
 		if err != nil {
@@ -283,6 +340,9 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 		if client.Port == 0 {
 			client = from
 		}
+		if err = p.resolveMetadata(p.ctx, metadata); err != nil {
+			continue
+		}
 		if remote == nil {
 			ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
 			remote, err = p.proxy.ListenPacketContext(ctx, metadata)
@@ -313,12 +373,6 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 					}
 				}
 			}()
-		}
-		ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
-		err = remote.ResolveUDP(ctx, metadata)
-		cancel()
-		if err != nil {
-			continue
 		}
 		if _, err := remote.WriteTo(payload, metadata.UDPAddr()); err != nil {
 			return

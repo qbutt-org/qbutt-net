@@ -38,8 +38,13 @@ func bind6(handle syscall.Handle, ifaceIdx int) error {
 
 func bindControl(ifaceIdx int, rAddrPort netip.AddrPort) controlFn {
 	return func(ctx context.Context, network, address string, c syscall.RawConn) (err error) {
-		addrPort, err := netip.ParseAddrPort(address)
-		if err == nil && !addrPort.Addr().IsGlobalUnicast() {
+		addrPort, _ := netip.ParseAddrPort(address)
+		destination := rAddrPort.Addr()
+		if !destination.IsValid() {
+			destination = addrPort.Addr()
+		}
+		// For ListenPacket, address is the local wildcard, not the destination.
+		if destination.IsValid() && !destination.IsUnspecified() && !destination.IsGlobalUnicast() {
 			return
 		}
 
@@ -55,13 +60,10 @@ func bindControl(ifaceIdx int, rAddrPort netip.AddrPort) controlFn {
 				innerErr = bind4err
 			case "udp6":
 				// golang will set network to udp6 when listenUDP on wildcard ip (eg: ":0", "")
-				if (!addrPort.Addr().IsValid() || addrPort.Addr().IsUnspecified()) && bind6err != nil && rAddrPort.Addr().Unmap().Is4() {
-					// try bind ipv6, if failed, ignore. it's a workaround for windows disable interface ipv6
-					if bind4err != nil {
-						innerErr = fmt.Errorf("%w (%s)", bind6err, bind4err)
-					} else {
-						innerErr = nil
-					}
+				if (!addrPort.Addr().IsValid() || addrPort.Addr().IsUnspecified()) && rAddrPort.Addr().Unmap().Is4() {
+					// IPv4 traffic on a dual-stack socket must use IP_UNICAST_IF.
+					// IPv6 may be disabled on the selected interface.
+					innerErr = bind4err
 				} else {
 					innerErr = bind6err
 				}

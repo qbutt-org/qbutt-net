@@ -106,7 +106,7 @@ function launch() {
   lines.on("line", line => {
     assert(Buffer.byteLength(line) < 65536);
     const reply = JSON.parse(line);
-    assert.equal(reply.v, 1);
+    assert.equal(reply.v, 2);
     const receive = replies.get(reply.id);
     assert(receive, "response id must match a request");
     replies.delete(reply.id);
@@ -122,7 +122,7 @@ function launch() {
     request(method: string, params: Record<string, unknown> = {}) {
       const requestId = ++id;
       const reply = deadline(new Promise<any>(resolve => replies.set(requestId, resolve)), method);
-      child.stdin.write(JSON.stringify({ v: 1, id: requestId, method, ...params }) + "\n");
+      child.stdin.write(JSON.stringify({ v: 2, id: requestId, method, ...params }) + "\n");
       return reply;
     },
   };
@@ -161,7 +161,7 @@ try {
   await writeFile(configPath, `tun: {enable: true}\ndns: {enable: true, listen: '0.0.0.0:53'}\nexternal-controller: 0.0.0.0:9090\nproxy-providers: {untrusted: {type: http, url: 'http://127.0.0.1:1/never'}}\nrules: ['MATCH,DIRECT']\nproxies:\n  - {name: selected, type: socks5, server: 127.0.0.1, port: ${upstreamPort}, udp: true}\n  - {name: chained, type: socks5, server: 127.0.0.1, port: ${upstreamPort}, DIALER_PROXY: selected}\n  - {name: bypass, type: direct}\n`);
   const child = childProcess();
   assert.equal((await child.request("list", { configPath })).error.code, "hello_required");
-  assert.equal((await child.request("hello", { v: 2 })).error.code, "protocol_mismatch");
+  assert.equal((await child.request("hello", { v: 1 })).error.code, "protocol_mismatch");
   assert.equal((await child.request("hello")).result.upstreamRevision, "d3ec342d441b086ec4318332f59dd05d8a2b5697");
   assert.equal((await child.request("list", { configPath })).result.proxies.length, 3);
   const boundedConfig = join(temporary, "bounds.yaml");
@@ -173,9 +173,16 @@ try {
   assert.equal((await child.request("list", { configPath: boundedConfig })).error.code, "response_limit");
   await writeFile(boundedConfig, "x".repeat(2 * 1024 * 1024 + 1));
   assert.equal((await child.request("list", { configPath: boundedConfig })).error.code, "config_limit");
-  const parameters = { configPath, proxyName: "selected", pathId: "fixture", generation: 1, interfaceName };
+  const parameters = { configPath, proxyName: "selected", pathId: "fixture", generation: 1, interfaceName,
+    dns: {server: "127.0.0.1:53", bootstrapServer: "127.0.0.1:53", family: "dual"} };
   await writeFile(boundedConfig, JSON.stringify({ proxies: [{ name: "selected", type: "vless", "xhttp-opts": { "download-settings": { PRIVATE_KEY: "existing-client-key.pem" } } }] }));
   assert.equal((await child.request("open", { ...parameters, configPath: boundedConfig })).error.code, "external_credentials_not_supported");
+  for (const options of [{ ECH_OPTS: { ENABLE: "true" } }, { "realm-opts": { enable: true } }, { "tlsmirror-opts": { server: "auxiliary.test" } }]) {
+    await writeFile(boundedConfig, JSON.stringify({ proxies: [{ name: "selected", type: "vless", ...options }] }));
+    assert.equal((await child.request("open", { ...parameters, configPath: boundedConfig })).error.code, "auxiliary_dns_not_supported");
+  }
+  await writeFile(boundedConfig, JSON.stringify({ proxies: [{ name: "selected", type: "hysteria", OBFS_PROTOCOL: "faketcp" }] }));
+  assert.equal((await child.request("open", { ...parameters, configPath: boundedConfig })).error.code, "unbound_transport_not_supported");
   assert.equal((await child.request("open", { ...parameters, interfaceName: "missing-qbutt-interface" })).error.code, "interface_unavailable");
   assert.equal((await child.request("open", { ...parameters, proxyName: "chained" })).error.code, "proxy_chain_not_supported");
   assert.equal((await child.request("open", { ...parameters, proxyName: "bypass" })).error.code, "unsupported_proxy_type");
@@ -242,7 +249,7 @@ try {
   assert.equal(tcpPayloadBytes, payload.length * 3);
   assert.equal(udpPayloadBytes, 1024);
   assert.deepEqual(upstreamErrors, []);
-  console.log(JSON.stringify({ passed: true, tcpPayloadBytes, udpPayloadBytes, checks: ["version handshake", "selected YAML import", "326-node subscription", "config/proxy/response bounds", "external credential rejection", "chain alias rejection", "interface validation", "required authentication", "TCP payload", "TCP half-close", "UDP payload", "generation guard", "accepted socket close", "EOF cleanup", "shutdown", "bounded invalid frames"] }));
+  console.log(JSON.stringify({ passed: true, tcpPayloadBytes, udpPayloadBytes, checks: ["version handshake", "selected YAML import", "326-node subscription", "config/proxy/response bounds", "external credential rejection", "auxiliary DNS and unbound transport rejection", "chain alias rejection", "interface validation", "required authentication", "TCP payload", "TCP half-close", "UDP payload", "generation guard", "accepted socket close", "EOF cleanup", "shutdown", "bounded invalid frames"] }));
 } finally {
   for (const child of children) if (child.child.exitCode === null) child.child.kill();
   for (const socket of sockets) socket.destroy();
