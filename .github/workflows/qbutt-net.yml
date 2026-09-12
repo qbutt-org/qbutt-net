@@ -1,0 +1,56 @@
+name: qbutt-net
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qbutt-net-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install pinned Go toolchain
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'qbutt-go.zip'
+          Invoke-WebRequest 'https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '9b858c41f36cc976282f8bf9130414351cd834fe25b5b07dec697957078bbc80') {
+            throw 'Go toolchain checksum mismatch'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'qbutt-go'
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $toolchain = Join-Path $destination 'golang.org/toolchain@v0.0.1-go1.27.1.windows-amd64'
+          $compiler = Join-Path $toolchain 'bin'
+          $compiler | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "GOROOT=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.0'
+      - name: Verify pinned compiler
+        shell: pwsh
+        run: |
+          if ((go env GOVERSION) -ne 'go1.27.1') { throw 'Unexpected Go compiler' }
+      - name: Build
+        run: go build -trimpath -o bin/qbutt-net.exe ./cmd/qbutt-net
+      - name: Vet
+        run: go vet ./cmd/qbutt-net
+      - name: Integration and fault scenarios
+        run: bun scripts/qbutt-net-integration.ts bin/qbutt-net.exe
+      - name: Check whitespace
+        run: git diff --check

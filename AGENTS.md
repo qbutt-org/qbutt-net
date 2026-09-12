@@ -19,6 +19,8 @@ Do not write unit tests. The generated legal integration fixture is `scripts/qbu
 
 The repository is public. Never commit or publish secrets, private profiles, dumps, keys or private dependency history; never print their values. Review the complete outgoing diff, stage explicit paths, and verify published commit and visibility through GitHub.
 
+`origin` is the standalone public `qbutt-org/qbutt-net` repository, whose only published branch is `main`. Keep the public upstream history and rebase qbutt changes onto deliberately pinned revisions of `MetaCubeX/mihomo`'s `Alpha` branch. Fetch only the required upstream branch/revision; never mirror upstream branches or tags into origin. `.github/workflows/qbutt-net.yml` owns this component's build, vet and integration checks; do not restore upstream publishing or cross-repository dispatch workflows.
+
 ## Maintaining instructions
 
 Если пользователь в ходе работы даёт новые устойчивые правила по стилю кода, структуре или процессу, то их надо кратко и по делу сразу добавлять в этот файл `AGENTS.md`, если это реально полезно будущим агентам.

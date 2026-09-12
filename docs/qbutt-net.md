@@ -4,9 +4,11 @@ qbutt-net wraps existing public Mihomo adapters in a child process for [qbutt](h
 
 ## Build and integration
 
-Verified on Windows amd64 with Go 1.23.3 and Bun 1.4.0, from this repository:
+Verified on Windows amd64 with Go 1.27.1 and Bun 1.4.0, from this repository with that compiler on `PATH`:
 
 ```powershell
+$env:CGO_ENABLED = '0'
+$env:GOTOOLCHAIN = 'local'
 go build -trimpath -o ../qbutt-build/qbutt-net.exe ./cmd/qbutt-net
 go vet ./cmd/qbutt-net
 bun scripts/qbutt-net-integration.ts ../qbutt-build/qbutt-net.exe
@@ -14,6 +16,8 @@ git diff --check
 ```
 
 The Bun fixture creates a temporary local upstream SOCKS/echo endpoint and profile, then exercises real TCP and UDP payloads, authentication failures, generation guards, import limits, external credential rejection, close, EOF, shutdown and invalid frames. An optional second argument after the executable selects the loopback interface. The fixture never reads a live profile or edits another client's settings. Linux builds are supported by the source but remain unverified here.
+
+The narrow [component workflow](../.github/workflows/qbutt-net.yml) pins the official Windows amd64 [Go toolchain module archive](https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip) by SHA-256. That archive was verified through Go's `sum.golang.org` database before its hash was pinned; [Go documents this authenticated toolchain distribution](https://go.dev/doc/toolchain). CI builds, vets and runs the same integration fixture on `main`, without publishing upstream products or dispatching to another repository.
 
 ## Private control channel
 
