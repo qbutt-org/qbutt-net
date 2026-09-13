@@ -10,15 +10,20 @@ Verified on Windows amd64 with Go 1.27.1 and Bun 1.4.0, from this repository wit
 $env:CGO_ENABLED = '0'
 $env:GOTOOLCHAIN = 'local'
 go build -trimpath -o ../qbutt-build/qbutt-net.exe ./cmd/qbutt-net
-go vet ./cmd/qbutt-net
+go build -trimpath -o ../qbutt-build/qbutt-gateway.exe ./cmd/qbutt-gateway
+go build -trimpath -o ../qbutt-build/qbutt-gateway-lab.exe ./scripts/gateway-lab
+go vet ./cmd/qbutt-net ./cmd/qbutt-gateway ./component/gateway ./scripts/gateway-lab
 bun scripts/qbutt-net-integration.ts ../qbutt-build/qbutt-net.exe
 bun scripts/qbutt-net-dns-integration.ts ../qbutt-build/qbutt-net.exe
+bun scripts/qbutt-gateway-integration.ts ../qbutt-build/qbutt-gateway.exe ../qbutt-build/qbutt-gateway-lab.exe
 git diff --check
 ```
 
 The Bun fixture creates a temporary local upstream SOCKS/echo endpoint and profile, then exercises real TCP and UDP payloads, authentication failures, generation guards, import limits, external credential rejection, close, EOF, shutdown and invalid frames. An optional second argument after the executable selects the loopback interface. The fixture never reads a live profile or edits another client's settings. Linux builds are supported by the source but remain unverified here.
 
 The DNS fixture uses two local TLS SOCKS adapters and a separate bootstrap DNS endpoint. It verifies independent A/AAAA results for the same name, preserved TLS server names, numeric IPv4/IPv6 destinations in real TCP/UDP relays, CNAME traversal, TTL caching and expiry, malformed responses, close cancellation and generation isolation. A local GOST endpoint that accepts TCP without answering verifies handshake timeout and pending TCP/UDP close. The fixture also verifies that `localhost` uses the selected path and that an imported rogue DNS endpoint receives no connections. It does not modify the machine's DNS settings or claim to intercept an actual system resolver. Public resolver reachability, physical-interface routing and external IPv6 connectivity need separate live probes.
+
+The gateway fixture launches and restarts the actual gateway process with generated certificates. It verifies the exact allowed client certificate across control, work and QUIC, the one-tenant limit, listener and connection quotas, TCP backpressure isolation, lease renewal/expiry/replacement, QUIC carrier failure, 1,200-, 1,500- and 65,507-byte UDP datagrams, reordered and duplicate fragments, incomplete-fragment expiry and bounds, aggregate rate limits, reflection rejection and bounded diagnostics. Its listeners are loopback fixtures; it does not claim public reachability through a real firewall or NAT.
 
 The optional [manual component workflow](../.github/workflows/qbutt-net.yml) pins the official Windows amd64 [Go toolchain module archive](https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip) by SHA-256. That archive was verified through Go's `sum.golang.org` database before its hash was pinned; [Go documents this authenticated toolchain distribution](https://go.dev/doc/toolchain). Releases are built and verified locally, then uploaded. The workflow runs only when the user explicitly requests a manual Actions run; pushes and pull requests do not trigger CI.
 
@@ -96,6 +101,16 @@ Listeners bind to IPv4 loopback on ephemeral ports with independent cryptographi
 
 At most eight paths and 512 tracked socket handles per path exist. Handshakes and adapter creation for a connection have deadlines; relay buffers are fixed. Close cancels in-progress dials, closes listeners and accepted TCP/UDP resources, closes the adapter and waits for its handlers. Generation must match before close. Restart creates new ports and credentials. Raw upstream logs are discarded; stderr contains only a fixed terminal control error when necessary.
 
+## Optional inbound gateway
+
+`qbutt-gateway` is a separately deployed reverse-listener service. Its server-owned JSON configuration names a TLS certificate/private key, a client CA and the lowercase or uppercase 64-hex `clientCertificateSHA256` of the one allowed client leaf certificate. Normal CA validation still runs first. The fingerprint is then compared exactly for control, TCP work and QUIC handshakes. The first release requires `maxClients: 1`; another CA-signed certificate is rejected during TLS rather than being admitted as a second tenant.
+
+The remaining bounded settings are `controlAddress`, `datagramAddress`, numeric `listenerIP` and `advertiseIP`, `allowedPorts`, `maxLeases`, `maxTCPPerLease`, `maxTCP`, `maxTTLSeconds`, `maxUDPPacketsPerSecond` and `maxUDPBytesPerSecond`. Defaults supplied by the executable are one client, eight leases, 32 TCP peers per lease, 256 TCP peers total, a 120-second maximum lease, 512 original UDP datagrams per second and 32 MiB of original UDP payload per second. A configured UDP byte rate must permit one maximum 65,507-byte UDP payload. Opening more leases does not multiply the shared tenant rate budget.
+
+Control frames are length-prefixed JSON over TLS 1.3. TCP peers are announced to the control session and joined to a separately authenticated TLS work connection. UDP payload uses QUIC DATAGRAM frames. One original UDP datagram is split into at most 64 fragments of at most 1,024 payload bytes and reassembled before the gateway writes exactly one UDP datagram to the public socket. Fragment identity includes lease, generation and a nonzero message number; endpoint, total size and fragment count must agree. Reassembly accepts reordered fragments, suppresses fragment and completed-message duplicates, and bounds incomplete state to 32 datagrams and 2,096,224 declared bytes for two seconds. Queues hold at most 16 complete outgoing datagrams.
+
+An authenticated control client can request `stats`. The result contains only aggregate payload, fragment, expiry and drop counters; it contains no certificate identity, lease token or remote endpoint. Rate, queue, policy and reassembly pressure have distinct counters. These are process-lifetime diagnostics, reset on an actual gateway process restart.
+
 ## Current boundaries
 
-This is one explicit outbound proxy path. Public inbound, independent remote egress, transport-specific live throughput, UDP mapping stability and application-wide discovery policy are not established by local fixture success. In particular, physical interface binding does not prove bypass of another system TUN. Do not label this prototype “Tunnels only”. TUIC is currently rejected because the pinned upstream adapter does not implement deterministic close of its QUIC pool; enabling it requires fixing and probing that lifecycle first.
+The qbutt-net child is one explicit outbound proxy path. The optional gateway implements authenticated reverse TCP and UDP listeners, but the local fixture does not establish public reachability, firewall/NAT policy, independent remote egress, transport-specific live throughput, UDP mapping stability or application-wide discovery policy. In particular, physical interface binding does not prove bypass of another system TUN. Do not label the outbound prototype “Tunnels only”. TUIC is currently rejected because the pinned upstream adapter does not implement deterministic close of its QUIC pool; enabling it requires fixing and probing that lifecycle first.

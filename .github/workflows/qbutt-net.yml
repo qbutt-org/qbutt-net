@@ -43,10 +43,16 @@ jobs:
         run: |
           if ((go env GOVERSION) -ne 'go1.27.1') { throw 'Unexpected Go compiler' }
       - name: Build
-        run: go build -trimpath -o bin/qbutt-net.exe ./cmd/qbutt-net
+        shell: pwsh
+        run: |
+          go build -trimpath -o bin/qbutt-net.exe ./cmd/qbutt-net
+          go build -trimpath -o bin/qbutt-gateway.exe ./cmd/qbutt-gateway
+          go build -trimpath -o bin/qbutt-gateway-lab.exe ./scripts/gateway-lab
       - name: Vet
-        run: go vet ./cmd/qbutt-net
+        run: go vet ./cmd/qbutt-net ./cmd/qbutt-gateway ./component/gateway ./scripts/gateway-lab
       - name: Integration and fault scenarios
         run: bun scripts/qbutt-net-integration.ts bin/qbutt-net.exe
+      - name: Gateway integration and fault scenarios
+        run: bun scripts/qbutt-gateway-integration.ts bin/qbutt-gateway.exe bin/qbutt-gateway-lab.exe
       - name: Check whitespace
         run: git diff --check

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -19,16 +21,19 @@ import (
 )
 
 type Config struct {
-	ControlAddress  string   `json:"controlAddress"`
-	DatagramAddress string   `json:"datagramAddress"`
-	ListenerIP      string   `json:"listenerIP"`
-	AdvertiseIP     string   `json:"advertiseIP"`
-	AllowedPorts    []uint16 `json:"allowedPorts"`
-	MaxClients      int      `json:"maxClients"`
-	MaxLeases       int      `json:"maxLeases"`
-	MaxTCPPerLease  int      `json:"maxTCPPerLease"`
-	MaxTCP          int      `json:"maxTCP"`
-	MaxTTLSeconds   int      `json:"maxTTLSeconds"`
+	ControlAddress          string   `json:"controlAddress"`
+	DatagramAddress         string   `json:"datagramAddress"`
+	ListenerIP              string   `json:"listenerIP"`
+	AdvertiseIP             string   `json:"advertiseIP"`
+	AllowedPorts            []uint16 `json:"allowedPorts"`
+	MaxClients              int      `json:"maxClients"`
+	MaxLeases               int      `json:"maxLeases"`
+	MaxTCPPerLease          int      `json:"maxTCPPerLease"`
+	MaxTCP                  int      `json:"maxTCP"`
+	MaxTTLSeconds           int      `json:"maxTTLSeconds"`
+	MaxUDPPacketsPerSecond  int      `json:"maxUDPPacketsPerSecond"`
+	MaxUDPBytesPerSecond    int      `json:"maxUDPBytesPerSecond"`
+	ClientCertificateSHA256 string   `json:"clientCertificateSHA256"`
 }
 
 type Server struct {
@@ -41,40 +46,48 @@ type Server struct {
 	sessions    map[string]*session
 	connections map[net.Conn]struct{}
 	peers       int
+	rate        datagramRate
+	stats       DatagramStats
 	wg          sync.WaitGroup
 }
 
 type session struct {
-	server     *Server
-	id         string
-	principal  [32]byte
-	control    net.Conn
-	writeMu    sync.Mutex
-	leases     map[string]*lease
-	generation map[string]uint64
-	udp        *quic.Conn
-	sendUDP    chan outgoingDatagram
-	closed     bool
+	server      *Server
+	id          string
+	principal   [32]byte
+	control     net.Conn
+	writeMu     sync.Mutex
+	leases      map[string]*lease
+	generation  map[string]uint64
+	udp         *quic.Conn
+	sendUDP     chan outgoingDatagram
+	nextMessage uint64
+	closed      bool
 }
 
 type outgoingDatagram struct {
-	lease *lease
-	data  []byte
+	lease     *lease
+	fragments [][]byte
+	bytes     int
+}
+
+type datagramRate struct {
+	updated      time.Time
+	packetTokens float64
+	byteTokens   float64
 }
 
 type lease struct {
-	owner     *session
-	info      LeaseInfo
-	deadline  time.Time
-	tcp       net.Listener
-	udp       *net.UDPConn
-	done      chan struct{}
-	peers     map[uint64]*peer
-	nextPeer  uint64
-	remote    map[netip.AddrPort]time.Time
-	rateEpoch time.Time
-	packets   int
-	active    bool
+	owner    *session
+	info     LeaseInfo
+	deadline time.Time
+	tcp      net.Listener
+	udp      *net.UDPConn
+	done     chan struct{}
+	peers    map[uint64]*peer
+	nextPeer uint64
+	remote   map[netip.AddrPort]time.Time
+	active   bool
 }
 
 type peer struct {
@@ -100,12 +113,25 @@ func New(config Config, tlsConfig *tls.Config, datagramTLS *qtls.Config) (*Serve
 			return nil, errors.New("ephemeral_requires_loopback")
 		}
 	}
-	if config.MaxClients < 1 || config.MaxClients > 32 || config.MaxLeases < 1 || config.MaxLeases > 8 || config.MaxTCPPerLease < 1 || config.MaxTCPPerLease > 64 || config.MaxTCP < 1 || config.MaxTCP > 256 || config.MaxTTLSeconds < 1 || config.MaxTTLSeconds > 300 {
+	if config.MaxClients != 1 || config.MaxLeases < 1 || config.MaxLeases > 8 || config.MaxTCPPerLease < 1 || config.MaxTCPPerLease > 64 || config.MaxTCP < 1 || config.MaxTCP > 256 || config.MaxTTLSeconds < 1 || config.MaxTTLSeconds > 300 ||
+		config.MaxUDPPacketsPerSecond < 1 || config.MaxUDPPacketsPerSecond > 4096 || config.MaxUDPBytesPerSecond < MaxDatagramPayload || config.MaxUDPBytesPerSecond > 256*1024*1024 {
 		return nil, errors.New("invalid_limits")
 	}
 	if tlsConfig == nil || tlsConfig.ClientAuth != tls.RequireAndVerifyClientCert || tlsConfig.MinVersion < tls.VersionTLS13 || datagramTLS == nil || datagramTLS.ClientAuth != qtls.RequireAndVerifyClientCert || datagramTLS.MinVersion < qtls.VersionTLS13 {
 		return nil, errors.New("mutual_tls_required")
 	}
+	fingerprintBytes, err := hex.DecodeString(config.ClientCertificateSHA256)
+	if err != nil || len(fingerprintBytes) != sha256.Size {
+		return nil, errors.New("client_certificate_fingerprint_required")
+	}
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], fingerprintBytes)
+	tlsConfig = tlsConfig.Clone()
+	datagramTLS = datagramTLS.Clone()
+	tlsConfig.SessionTicketsDisabled = true
+	datagramTLS.SessionTicketsDisabled = true
+	tlsConfig.VerifyPeerCertificate = fingerprintVerifier(fingerprint, tlsConfig.VerifyPeerCertificate)
+	datagramTLS.VerifyPeerCertificate = fingerprintVerifier(fingerprint, datagramTLS.VerifyPeerCertificate)
 	control, err := tls.Listen("tcp", config.ControlAddress, tlsConfig)
 	if err != nil {
 		return nil, errors.New("control_listen_failed")
@@ -117,12 +143,31 @@ func New(config Config, tlsConfig *tls.Config, datagramTLS *qtls.Config) (*Serve
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{config: config, control: control, datagrams: udp, ctx: ctx, cancel: cancel,
-		sessions: make(map[string]*session), connections: make(map[net.Conn]struct{})}
+		sessions: make(map[string]*session), connections: make(map[net.Conn]struct{}),
+		rate: datagramRate{updated: time.Now(), packetTokens: float64(config.MaxUDPPacketsPerSecond), byteTokens: float64(config.MaxUDPBytesPerSecond)}}
 	s.wg.Add(3)
 	go s.acceptTLS()
 	go s.acceptQUIC()
 	go s.expire()
 	return s, nil
+}
+
+func fingerprintVerifier(expected [sha256.Size]byte, previous func([][]byte, [][]*x509.Certificate) error) func([][]byte, [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if previous != nil {
+			if err := previous(rawCerts, verifiedChains); err != nil {
+				return err
+			}
+		}
+		if len(rawCerts) == 0 {
+			return errors.New("client_certificate_rejected")
+		}
+		actual := sha256.Sum256(rawCerts[0])
+		if subtle.ConstantTimeCompare(actual[:], expected[:]) != 1 {
+			return errors.New("client_certificate_rejected")
+		}
+		return nil
+	}
 }
 
 func QUICConfig() *quic.Config {
@@ -301,6 +346,11 @@ func (s *Server) serveControl(conn net.Conn, first Request, principal [32]byte) 
 			} else if request.Method == "release" {
 				current.close()
 			}
+		case "stats":
+			s.mu.Lock()
+			stats := s.stats
+			s.mu.Unlock()
+			response.Datagrams = &stats
 		default:
 			response.Error = "unknown_method"
 		}
@@ -646,7 +696,7 @@ func (s *Server) serveQUIC(conn *quic.Conn) {
 		return
 	}
 	owner.udp = conn
-	queue := make(chan outgoingDatagram, 32)
+	queue := make(chan outgoingDatagram, 16)
 	owner.sendUDP = queue
 	s.mu.Unlock()
 	defer func() {
@@ -684,46 +734,107 @@ func (s *Server) serveQUIC(conn *quic.Conn) {
 				s.mu.Lock()
 				valid := packet.lease.active && owner.udp == conn && time.Now().Before(packet.lease.deadline)
 				s.mu.Unlock()
-				if valid && conn.SendDatagram(packet.data) != nil {
-					conn.CloseWithError(1, "datagram_send_failed")
-					return
+				if valid {
+					for _, fragment := range packet.fragments {
+						if conn.SendDatagram(fragment) != nil {
+							conn.CloseWithError(1, "datagram_send_failed")
+							return
+						}
+						s.mu.Lock()
+						s.stats.FragmentsSent++
+						s.mu.Unlock()
+					}
+					s.mu.Lock()
+					s.stats.ToClientPackets++
+					s.stats.ToClientBytes += uint64(packet.bytes)
+					s.mu.Unlock()
 				}
 			}
 		}
 	}()
 	defer func() { conn.CloseWithError(0, "datagrams_closed"); <-senderDone }()
+	var reassembler Reassembler
 	for {
 		data, err := conn.ReceiveDatagram(s.ctx)
 		if err != nil {
 			return
 		}
-		packet, err := DecodeDatagram(data)
+		s.mu.Lock()
+		s.stats.FragmentsReceived++
+		s.mu.Unlock()
+		fragment, err := DecodeDatagram(data)
 		if err != nil {
+			s.mu.Lock()
+			s.stats.InvalidFragments++
+			s.mu.Unlock()
+			continue
+		}
+		packet, status, expired := reassembler.Add(fragment, time.Now())
+		s.mu.Lock()
+		s.stats.ExpiredAssemblies += uint64(expired)
+		switch status {
+		case ReassemblyDuplicate:
+			s.stats.DuplicateFragments++
+		case ReassemblyDropped:
+			s.stats.ReassemblyDrops++
+		}
+		s.mu.Unlock()
+		if status != ReassemblyComplete {
 			continue
 		}
 		s.mu.Lock()
 		current := owner.leases[packet.Lease]
-		valid := current != nil && current.active && current.udp != nil && current.info.Generation == packet.Generation && time.Now().Before(current.deadline) && time.Since(current.remote[packet.Remote]) < 30*time.Second && current.allowPacket()
+		valid := current != nil && current.active && current.udp != nil && current.info.Generation == packet.Generation && time.Now().Before(current.deadline) && time.Since(current.remote[packet.Remote]) < 30*time.Second
+		if !valid {
+			s.stats.PolicyDrops++
+		} else if allowed, packetLimited := s.allowDatagram(len(packet.Payload)); !allowed {
+			valid = false
+			s.recordRateDrop(packetLimited)
+		}
 		s.mu.Unlock()
 		if valid {
 			current.udp.SetWriteDeadline(time.Now().Add(time.Second))
-			current.udp.WriteToUDPAddrPort(packet.Payload, packet.Remote)
+			if written, err := current.udp.WriteToUDPAddrPort(packet.Payload, packet.Remote); err == nil && written == len(packet.Payload) {
+				s.mu.Lock()
+				s.stats.ToPublicPackets++
+				s.stats.ToPublicBytes += uint64(written)
+				s.mu.Unlock()
+			}
 		}
 	}
 }
 
-// Called under the server lock; one bounded budget includes both directions.
-func (current *lease) allowPacket() bool {
+// Called under the server lock; one tenant budget includes both directions and
+// is shared by every lease so more listeners cannot multiply it.
+func (s *Server) allowDatagram(bytes int) (bool, bool) {
 	now := time.Now()
-	if now.Sub(current.rateEpoch) >= time.Second {
-		current.rateEpoch = now
-		current.packets = 0
+	elapsed := now.Sub(s.rate.updated).Seconds()
+	s.rate.updated = now
+	s.rate.packetTokens += elapsed * float64(s.config.MaxUDPPacketsPerSecond)
+	if s.rate.packetTokens > float64(s.config.MaxUDPPacketsPerSecond) {
+		s.rate.packetTokens = float64(s.config.MaxUDPPacketsPerSecond)
 	}
-	if current.packets >= 512 {
-		return false
+	s.rate.byteTokens += elapsed * float64(s.config.MaxUDPBytesPerSecond)
+	if s.rate.byteTokens > float64(s.config.MaxUDPBytesPerSecond) {
+		s.rate.byteTokens = float64(s.config.MaxUDPBytesPerSecond)
 	}
-	current.packets++
-	return true
+	if s.rate.packetTokens < 1 {
+		return false, true
+	}
+	if s.rate.byteTokens < float64(bytes) {
+		return false, false
+	}
+	s.rate.packetTokens--
+	s.rate.byteTokens -= float64(bytes)
+	return true, false
+}
+
+func (s *Server) recordRateDrop(packetLimited bool) {
+	if packetLimited {
+		s.stats.PacketRateDrops++
+	} else {
+		s.stats.ByteRateDrops++
+	}
 }
 
 func (current *lease) readUDP() {
@@ -737,13 +848,10 @@ func (current *lease) readUDP() {
 		if err != nil {
 			return
 		}
-		if size > MaxDatagramPayload {
-			continue
-		}
 		remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
 		s.mu.Lock()
 		conn := current.owner.udp
-		valid := current.active && time.Now().Before(current.deadline) && conn != nil && current.allowPacket()
+		valid := size <= MaxDatagramPayload && current.active && time.Now().Before(current.deadline) && conn != nil
 		if valid {
 			now := time.Now()
 			for peer, seen := range current.remote {
@@ -757,16 +865,28 @@ func (current *lease) readUDP() {
 				current.remote[remote] = now
 			}
 		}
+		if !valid {
+			s.stats.PolicyDrops++
+		} else if allowed, packetLimited := s.allowDatagram(size); !allowed {
+			valid = false
+			s.recordRateDrop(packetLimited)
+		}
+		current.owner.nextMessage++
+		if current.owner.nextMessage == 0 {
+			current.owner.nextMessage++
+		}
+		message := current.owner.nextMessage
 		packet := Datagram{Lease: current.info.Lease, Generation: current.info.Generation, Remote: remote, Payload: buffer[:size]}
 		s.mu.Unlock()
 		if valid {
-			data, err := EncodeDatagram(packet)
+			fragments, err := EncodeDatagram(packet, message)
 			if err == nil {
 				s.mu.Lock()
 				if current.active && current.owner.udp == conn {
 					select {
-					case current.owner.sendUDP <- outgoingDatagram{lease: current, data: data}:
+					case current.owner.sendUDP <- outgoingDatagram{lease: current, fragments: fragments, bytes: size}:
 					default:
+						s.stats.QueueDrops++
 					}
 				}
 				s.mu.Unlock()

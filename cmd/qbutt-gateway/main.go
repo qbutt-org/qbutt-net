@@ -34,7 +34,8 @@ func run() error {
 		return fmt.Errorf("config_unreadable")
 	}
 	defer file.Close()
-	config := configuration{Config: gateway.Config{MaxClients: 16, MaxLeases: 8, MaxTCPPerLease: 32, MaxTCP: 256, MaxTTLSeconds: 120}}
+	config := configuration{Config: gateway.Config{MaxClients: 1, MaxLeases: 8, MaxTCPPerLease: 32, MaxTCP: 256, MaxTTLSeconds: 120,
+		MaxUDPPacketsPerSecond: 512, MaxUDPBytesPerSecond: 32 * 1024 * 1024}}
 	decoder := json.NewDecoder(io.LimitReader(file, gateway.MaxFrameBytes+1))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&config) != nil || decoder.Decode(new(any)) != io.EOF {

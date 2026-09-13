@@ -72,7 +72,7 @@ func connect(address string, config *tls.Config) *control {
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", address, config)
 	must(err)
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	must(gateway.WriteFrame(conn, gateway.Request{Version: 1, ID: 1, Method: "control"}))
+	must(gateway.WriteFrame(conn, gateway.Request{Version: gateway.Version, ID: 1, Method: "control"}))
 	var response gateway.Response
 	must(gateway.ReadFrame(conn, &response))
 	check(response.Error == "" && response.Session != "", "control authentication failed")
@@ -80,7 +80,7 @@ func connect(address string, config *tls.Config) *control {
 }
 func (c *control) request(request gateway.Request) gateway.Response {
 	c.next++
-	request.Version = 1
+	request.Version = gateway.Version
 	request.ID = c.next
 	request.Session = c.session
 	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -121,7 +121,7 @@ func work(address string, config *tls.Config, accepted gateway.Accepted) (*tls.C
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", address, config)
 	must(err)
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	must(gateway.WriteFrame(conn, gateway.Request{Version: 1, ID: 1, Method: "work", Session: accepted.Session, Lease: accepted.Lease, Generation: accepted.Generation, Connection: accepted.Connection}))
+	must(gateway.WriteFrame(conn, gateway.Request{Version: gateway.Version, ID: 1, Method: "work", Session: accepted.Session, Lease: accepted.Lease, Generation: accepted.Generation, Connection: accepted.Connection}))
 	var response gateway.Response
 	must(gateway.ReadFrame(conn, &response))
 	return conn, response
@@ -134,7 +134,7 @@ func udpChannel(address string, config *qtls.Config, session string) *quic.Conn 
 	stream, err := conn.OpenStreamSync(ctx)
 	must(err)
 	stream.SetDeadline(time.Now().Add(5 * time.Second))
-	must(gateway.WriteFrame(stream, gateway.Request{Version: 1, ID: 1, Method: "datagrams", Session: session}))
+	must(gateway.WriteFrame(stream, gateway.Request{Version: gateway.Version, ID: 1, Method: "datagrams", Session: session}))
 	var response gateway.Response
 	must(gateway.ReadFrame(stream, &response))
 	check(response.Error == "" && response.Session == session, "datagram authentication failed")
@@ -144,11 +144,64 @@ func udpChannel(address string, config *qtls.Config, session string) *quic.Conn 
 func receive(conn *quic.Conn) gateway.Datagram {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	data, err := conn.ReceiveDatagram(ctx)
+	var reassembler gateway.Reassembler
+	for {
+		data, err := conn.ReceiveDatagram(ctx)
+		must(err)
+		fragment, err := gateway.DecodeDatagram(data)
+		must(err)
+		packet, status, _ := reassembler.Add(fragment, time.Now())
+		if status == gateway.ReassemblyComplete {
+			return packet
+		}
+	}
+}
+func send(conn *quic.Conn, packet gateway.Datagram, message uint64, reverse bool, duplicate int) {
+	fragments, err := gateway.EncodeDatagram(packet, message)
 	must(err)
-	packet, err := gateway.DecodeDatagram(data)
-	must(err)
-	return packet
+	if reverse {
+		for left, right := 0, len(fragments)-1; left < right; left, right = left+1, right-1 {
+			fragments[left], fragments[right] = fragments[right], fragments[left]
+		}
+	}
+	for index, fragment := range fragments {
+		must(conn.SendDatagram(fragment))
+		if index == duplicate {
+			must(conn.SendDatagram(fragment))
+		}
+	}
+}
+func rejectTLS(address string, config *tls.Config, request gateway.Request) bool {
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", address, config)
+	if err != nil {
+		return true
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if gateway.WriteFrame(conn, request) != nil {
+		return true
+	}
+	var response gateway.Response
+	return gateway.ReadFrame(conn, &response) != nil
+}
+func rejectQUIC(address string, config *qtls.Config) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, address, config, gateway.QUICConfig())
+	if err != nil {
+		return true
+	}
+	defer conn.CloseWithError(0, "fixture_done")
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return true
+	}
+	stream.SetDeadline(time.Now().Add(2 * time.Second))
+	if gateway.WriteFrame(stream, gateway.Request{Version: gateway.Version, ID: 1, Method: "datagrams", Session: "invalid"}) != nil {
+		return true
+	}
+	var response gateway.Response
+	return gateway.ReadFrame(stream, &response) != nil
 }
 func expectClosed(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -172,6 +225,57 @@ func expectNoUDP(conn *net.UDPConn) {
 	_, _, err := conn.ReadFromUDPAddrPort(b[:])
 	timeout, ok := err.(net.Error)
 	check(ok && timeout.Timeout(), "rejected UDP packet escaped")
+}
+
+type readyInfo struct {
+	Ready     bool   `json:"ready"`
+	Control   string `json:"control"`
+	Datagrams string `json:"datagrams"`
+}
+
+type gatewayProcess struct {
+	command *exec.Cmd
+	stdin   io.WriteCloser
+	wait    chan error
+	log     *os.File
+	ready   readyInfo
+}
+
+func startGateway(executable, configPath, logPath string) *gatewayProcess {
+	command := exec.Command(executable, "--config", configPath, "--stdio")
+	stdout, err := command.StdoutPipe()
+	must(err)
+	stdin, err := command.StdinPipe()
+	must(err)
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	must(err)
+	command.Stderr = log
+	must(command.Start())
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
+	process := &gatewayProcess{command: command, stdin: stdin, wait: wait, log: log}
+	if err := json.NewDecoder(stdout).Decode(&process.ready); err != nil || !process.ready.Ready {
+		process.stop()
+		panic("server not ready")
+	}
+	return process
+}
+
+func (process *gatewayProcess) stop() {
+	if process.command == nil {
+		return
+	}
+	process.stdin.Close()
+	select {
+	case err := <-process.wait:
+		must(err)
+	case <-time.After(8 * time.Second):
+		process.command.Process.Kill()
+		<-process.wait
+		panic("gateway shutdown timeout")
+	}
+	process.log.Close()
+	process.command = nil
 }
 
 func run() (evidence map[string]any) {
@@ -198,43 +302,23 @@ func run() (evidence map[string]any) {
 	serverPair := issue(ca, caKey, true)
 	clientPair := issue(ca, caKey, false)
 	otherPair := issue(ca, caKey, false)
+	clientBlock, _ := pem.Decode(clientPair.certificate)
+	check(clientBlock != nil, "client certificate encoding")
+	clientFingerprint := sha256.Sum256(clientBlock.Bytes)
 	for name, data := range map[string][]byte{"ca.pem": caPEM, "server.pem": serverPair.certificate, "server-key.pem": serverPair.key} {
 		must(os.WriteFile(filepath.Join(root, name), data, 0600))
 	}
-	config := map[string]any{"controlAddress": "127.0.0.1:0", "datagramAddress": "127.0.0.1:0", "listenerIP": "127.0.0.1", "advertiseIP": "127.0.0.1", "allowedPorts": []int{0}, "maxClients": 2, "maxLeases": 2, "maxTCPPerLease": 2, "maxTCP": 4, "maxTTLSeconds": 20, "certificate": filepath.Join(root, "server.pem"), "privateKey": filepath.Join(root, "server-key.pem"), "clientCA": filepath.Join(root, "ca.pem")}
+	config := map[string]any{"controlAddress": "127.0.0.1:0", "datagramAddress": "127.0.0.1:0", "listenerIP": "127.0.0.1", "advertiseIP": "127.0.0.1", "allowedPorts": []int{0}, "maxClients": 1, "maxLeases": 2, "maxTCPPerLease": 2, "maxTCP": 4, "maxTTLSeconds": 20, "maxUDPPacketsPerSecond": 64, "maxUDPBytesPerSecond": 4 * gateway.MaxDatagramPayload, "clientCertificateSHA256": hex.EncodeToString(clientFingerprint[:]), "certificate": filepath.Join(root, "server.pem"), "privateKey": filepath.Join(root, "server-key.pem"), "clientCA": filepath.Join(root, "ca.pem")}
 	encoded, _ := json.Marshal(config)
 	configPath := filepath.Join(root, "config.json")
 	must(os.WriteFile(configPath, encoded, 0600))
-	command := exec.Command(os.Args[1], "--config", configPath, "--stdio")
-	stdout, err := command.StdoutPipe()
-	must(err)
-	stdin, err := command.StdinPipe()
-	must(err)
-	log, err := os.Create(filepath.Join(root, "server.log"))
-	must(err)
-	defer log.Close()
-	command.Stderr = log
-	must(command.Start())
-	wait := make(chan error, 1)
-	go func() { wait <- command.Wait() }()
+	process := startGateway(os.Args[1], configPath, filepath.Join(root, "server.log"))
 	defer func() {
-		stdin.Close()
-		select {
-		case err := <-wait:
-			must(err)
-		case <-time.After(8 * time.Second):
-			command.Process.Kill()
-			<-wait
-			panic("gateway shutdown timeout")
+		if process != nil {
+			process.stop()
 		}
 	}()
-	var ready struct {
-		Ready     bool   `json:"ready"`
-		Control   string `json:"control"`
-		Datagrams string `json:"datagrams"`
-	}
-	must(json.NewDecoder(stdout).Decode(&ready))
-	check(ready.Ready, "server not ready")
+	ready := process.ready
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
 	clientCert, err := tls.X509KeyPair(clientPair.certificate, clientPair.key)
@@ -247,17 +331,26 @@ func run() (evidence map[string]any) {
 	quicConfig := &qtls.Config{MinVersion: qtls.VersionTLS13, NextProtos: []string{gateway.ALPN}, RootCAs: pool, Certificates: []qtls.Certificate{quicCert}, ServerName: "127.0.0.1"}
 	noCertificate := tlsConfig.Clone()
 	noCertificate.Certificates = nil
-	bad, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", ready.Control, noCertificate)
-	if err == nil {
-		bad.SetDeadline(time.Now().Add(2 * time.Second))
-		gateway.WriteFrame(bad, gateway.Request{Version: 1, ID: 1, Method: "control"})
-		var response gateway.Response
-		err = gateway.ReadFrame(bad, &response)
-		bad.Close()
-	}
-	check(err != nil, "anonymous TLS admitted")
+	check(rejectTLS(ready.Control, noCertificate, gateway.Request{Version: gateway.Version, ID: 1, Method: "control"}), "anonymous TLS admitted")
+	otherTLS := tlsConfig.Clone()
+	otherTLS.Certificates = []tls.Certificate{otherCert}
+	otherQUICCert, err := qtls.X509KeyPair(otherPair.certificate, otherPair.key)
+	must(err)
+	otherQUIC := quicConfig.Clone()
+	otherQUIC.Certificates = []qtls.Certificate{otherQUICCert}
+	check(rejectTLS(ready.Control, otherTLS, gateway.Request{Version: gateway.Version, ID: 1, Method: "control"}), "other CA-signed client admitted to control")
+	check(rejectQUIC(ready.Datagrams, otherQUIC), "other CA-signed client admitted to QUIC")
 	control := connect(ready.Control, tlsConfig)
 	defer control.conn.Close()
+	secondControl, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", ready.Control, tlsConfig)
+	must(err)
+	secondControl.SetDeadline(time.Now().Add(2 * time.Second))
+	must(gateway.WriteFrame(secondControl, gateway.Request{Version: gateway.Version, ID: 1, Method: "control"}))
+	var limited gateway.Response
+	must(gateway.ReadFrame(secondControl, &limited))
+	check(limited.Error == "client_limit", "one-tenant session limit bypassed")
+	secondControl.Close()
+	evidence["exactClientCertificateAndSingleTenant"] = true
 	check(control.request(gateway.Request{Method: "acquire", Path: "one", Generation: 1, TCP: true, UDP: true, TTLSeconds: 10}).Error == "datagrams_required", "UDP advertised without carrier")
 	udp := udpChannel(ready.Datagrams, quicConfig, control.session)
 	defer udp.CloseWithError(0, "fixture_done")
@@ -272,11 +365,7 @@ func run() (evidence map[string]any) {
 	defer firstPeer.Close()
 	firstAccepted := control.accepted()
 	check(firstAccepted.Remote == firstPeer.LocalAddr().String(), "original TCP endpoint lost")
-	otherTLS := tlsConfig.Clone()
-	otherTLS.Certificates = []tls.Certificate{otherCert}
-	stolen, rejected := work(ready.Control, otherTLS, firstAccepted)
-	check(rejected.Error == "work_rejected", "other principal stole accepted socket")
-	stolen.Close()
+	check(rejectTLS(ready.Control, otherTLS, gateway.Request{Version: gateway.Version, ID: 1, Method: "work", Session: firstAccepted.Session, Lease: firstAccepted.Lease, Generation: firstAccepted.Generation, Connection: firstAccepted.Connection}), "other CA-signed client admitted to work")
 	firstWork, accepted := work(ready.Control, tlsConfig, firstAccepted)
 	mustErr := accepted.Error
 	check(mustErr == "" && accepted.Accepted.Remote == firstPeer.LocalAddr().String(), "trusted work metadata mismatch")
@@ -318,41 +407,118 @@ func run() (evidence map[string]any) {
 	must(err)
 	defer publicUDP.Close()
 	endpoint := netip.MustParseAddrPort(lease.Endpoint)
-	udpPayload := []byte("original UDP datagram\x00not a stream")
-	_, err = publicUDP.WriteToUDPAddrPort(udpPayload, endpoint)
+	var packet gateway.Datagram
+	var replay [][]byte
+	verifiedUDP := 0
+	for index, size := range []int{1200, 1500, gateway.MaxDatagramPayload} {
+		udpPayload := bytes.Repeat([]byte{byte(41 + index)}, size)
+		_, err = publicUDP.WriteToUDPAddrPort(udpPayload, endpoint)
+		must(err)
+		packet = receive(udp)
+		check(packet.Lease == lease.Lease && packet.Generation == 1 && packet.Remote == publicUDP.LocalAddr().(*net.UDPAddr).AddrPort() && bytes.Equal(packet.Payload, udpPayload), "fragmented public UDP payload or endpoint mismatch")
+		verifiedUDP += len(packet.Payload)
+		replay, err = gateway.EncodeDatagram(packet, uint64(index+1))
+		must(err)
+		for left, right := 0, len(replay)-1; left < right; left, right = left+1, right-1 {
+			replay[left], replay[right] = replay[right], replay[left]
+		}
+		for fragmentIndex, fragment := range replay {
+			must(udp.SendDatagram(fragment))
+			if size == 1500 && fragmentIndex == 0 {
+				must(udp.SendDatagram(fragment))
+			}
+		}
+		publicUDP.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buffer := make([]byte, 65535)
+		n, source, err := publicUDP.ReadFromUDPAddrPort(buffer)
+		must(err)
+		check(source == endpoint && bytes.Equal(buffer[:n], udpPayload), "fragmented client UDP payload or listener endpoint mismatch")
+		verifiedUDP += n
+	}
+	evidence["fragmentedUDPVerifiedBytes"] = verifiedUDP
+	evidence["fragmentedUDPSizes"] = []int{1200, 1500, gateway.MaxDatagramPayload}
+	for _, fragment := range replay {
+		must(udp.SendDatagram(fragment))
+	}
+	expectNoUDP(publicUDP)
+
+	lost := gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: publicUDP.LocalAddr().(*net.UDPAddr).AddrPort(), Payload: bytes.Repeat([]byte{0x71}, 1500)}
+	lostFragments, err := gateway.EncodeDatagram(lost, 100)
 	must(err)
-	packet := receive(udp)
-	check(packet.Lease == lease.Lease && packet.Generation == 1 && packet.Remote == publicUDP.LocalAddr().(*net.UDPAddr).AddrPort() && bytes.Equal(packet.Payload, udpPayload), "UDP metadata or payload mismatch")
-	packet.Payload = []byte("reply datagram")
-	wire, err := gateway.EncodeDatagram(packet)
-	must(err)
-	must(udp.SendDatagram(wire))
+	must(udp.SendDatagram(lostFragments[0]))
+	expectNoUDP(publicUDP)
+	time.Sleep(gateway.DatagramFragmentLifetime + 100*time.Millisecond)
+	must(udp.SendDatagram(lostFragments[1]))
+	expectNoUDP(publicUDP)
+	for message := uint64(200); message < 240; message++ {
+		incomplete, encodeErr := gateway.EncodeDatagram(gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: lost.Remote, Payload: bytes.Repeat([]byte{0x72}, gateway.MaxDatagramPayload)}, message)
+		must(encodeErr)
+		must(udp.SendDatagram(incomplete[0]))
+	}
+	time.Sleep(gateway.DatagramFragmentLifetime + 100*time.Millisecond)
+	postLoss := gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: lost.Remote, Payload: []byte("valid after incomplete fragments")}
+	send(udp, postLoss, 300, false, -1)
 	publicUDP.SetReadDeadline(time.Now().Add(3 * time.Second))
-	var buffer [2048]byte
-	n, source, err := publicUDP.ReadFromUDPAddrPort(buffer[:])
+	buffer := make([]byte, 65535)
+	n, source, err := publicUDP.ReadFromUDPAddrPort(buffer)
 	must(err)
-	check(source == endpoint && bytes.Equal(buffer[:n], packet.Payload), "UDP listener port or payload lost")
-	_, err = publicUDP.WriteToUDPAddrPort(bytes.Repeat([]byte{0x7f}, gateway.MaxDatagramPayload+1024), endpoint)
+	check(source == endpoint && bytes.Equal(buffer[:n], postLoss.Payload), "incomplete fragments poisoned later datagram")
+
+	stale, err := gateway.EncodeDatagram(gateway.Datagram{Lease: lease.Lease, Generation: 2, Remote: lost.Remote, Payload: []byte("stale")}, 301)
 	must(err)
-	afterOversize := []byte("valid datagram after oversized public packet")
-	_, err = publicUDP.WriteToUDPAddrPort(afterOversize, endpoint)
-	must(err)
-	packet = receive(udp)
-	check(packet.Remote == publicUDP.LocalAddr().(*net.UDPAddr).AddrPort() && bytes.Equal(packet.Payload, afterOversize),
-		"oversized public packet terminated the UDP lease")
-	evidence["oversizedDatagramDroppedWithoutRetiringLease"] = true
-	stale := append([]byte{}, wire...)
-	binary.BigEndian.PutUint64(stale[17:25], 2)
-	must(udp.SendDatagram(stale))
+	for _, fragment := range stale {
+		must(udp.SendDatagram(fragment))
+	}
 	expectNoUDP(publicUDP)
 	unseen, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	must(err)
 	defer unseen.Close()
 	packet.Remote = unseen.LocalAddr().(*net.UDPAddr).AddrPort()
-	forged, err := gateway.EncodeDatagram(packet)
-	must(err)
-	must(udp.SendDatagram(forged))
+	packet.Payload = []byte("forged reflection")
+	send(udp, packet, 302, false, -1)
 	expectNoUDP(unseen)
+
+	time.Sleep(time.Second)
+	byteRatePackets := 8
+	byteRateReceived := make(chan int, 1)
+	go func() {
+		count := 0
+		largeBuffer := make([]byte, 65535)
+		for {
+			publicUDP.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+			if _, _, readErr := publicUDP.ReadFromUDPAddrPort(largeBuffer); readErr != nil {
+				byteRateReceived <- count
+				return
+			}
+			count++
+		}
+	}()
+	for message := uint64(350); message < uint64(350+byteRatePackets); message++ {
+		send(udp, gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: lost.Remote, Payload: bytes.Repeat([]byte{0x62}, gateway.MaxDatagramPayload)}, message, false, -1)
+	}
+	deliveredByteRate := <-byteRateReceived
+	check(deliveredByteRate > 0 && deliveredByteRate < byteRatePackets, "tenant byte rate cap was not observable")
+	time.Sleep(time.Second)
+	for message := uint64(400); message < 500; message++ {
+		send(udp, gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: lost.Remote, Payload: []byte("rate")}, message, false, -1)
+	}
+	receivedRatePackets := 0
+	for {
+		publicUDP.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, _, readErr := publicUDP.ReadFromUDPAddrPort(buffer)
+		if readErr != nil {
+			break
+		}
+		receivedRatePackets++
+	}
+	check(receivedRatePackets > 0 && receivedRatePackets < 100, "tenant packet rate cap was not observable")
+	statsResponse := control.request(gateway.Request{Method: "stats"})
+	check(statsResponse.Error == "" && statsResponse.Datagrams != nil, "datagram diagnostics unavailable")
+	stats := *statsResponse.Datagrams
+	check(stats.DuplicateFragments > 0 && stats.ExpiredAssemblies > 0 && stats.ReassemblyDrops > 0 && stats.PolicyDrops >= 2 && stats.PacketRateDrops > 0 && stats.ByteRateDrops > 0, "bounded datagram diagnostics incomplete")
+	evidence["datagramStats"] = stats
+	evidence["byteRateDeliveredPackets"] = deliveredByteRate
+	evidence["rateDeliveredPackets"] = receivedRatePackets
 	evidence["trueDatagramsOriginalEndpointAndNoReflection"] = true
 	replacement := control.acquire("one", 2, true, 20)
 	check(replacement.Lease != lease.Lease, "lease token reused")
@@ -360,7 +526,9 @@ func run() (evidence map[string]any) {
 	expectClosed(secondWork)
 	firstPeer.Close()
 	<-blocked
-	must(udp.SendDatagram(wire))
+	for _, fragment := range replay {
+		must(udp.SendDatagram(fragment))
+	}
 	expectNoUDP(publicUDP)
 	check(control.request(gateway.Request{Method: "renew", Lease: lease.Lease, Generation: 1, TTLSeconds: 20}).Error == "lease_rejected", "old lease renewed")
 	check(control.request(gateway.Request{Method: "release", Lease: replacement.Lease, Generation: 2}).Error == "", "replacement release failed")
@@ -399,6 +567,8 @@ func run() (evidence map[string]any) {
 	check(fresh.session != control.session, "control session token reused")
 	reset := fresh.acquire("one", 1, false, 20)
 	check(reset.Lease != lease.Lease, "restart token replay")
+	persistentStats := fresh.request(gateway.Request{Method: "stats"})
+	check(persistentStats.Error == "" && persistentStats.Datagrams != nil && persistentStats.Datagrams.ToPublicBytes == stats.ToPublicBytes && persistentStats.Datagrams.PacketRateDrops == stats.PacketRateDrops && persistentStats.Datagrams.ByteRateDrops == stats.ByteRateDrops, "control reconnect reset process diagnostics")
 	oldWork, rejected := work(ready.Control, tlsConfig, firstAccepted)
 	check(rejected.Error == "work_rejected", "old control session work accepted")
 	oldWork.Close()
@@ -410,6 +580,22 @@ func run() (evidence map[string]any) {
 	_, err = net.DialTimeout("tcp", reset.Endpoint, 300*time.Millisecond)
 	check(err != nil, "malformed control retained listener")
 	evidence["controlAndQUICFailureRetireLeases"] = true
+	firstPID := process.command.Process.Pid
+	process.stop()
+	process = startGateway(os.Args[1], configPath, filepath.Join(root, "server.log"))
+	ready = process.ready
+	check(process.command.Process.Pid != firstPID, "gateway process did not restart")
+	restarted := connect(ready.Control, tlsConfig)
+	restartedLease := restarted.acquire("one", 1, false, 20)
+	check(restarted.session != fresh.session && restartedLease.Lease != reset.Lease, "process restart reused authentication state")
+	restartedStats := restarted.request(gateway.Request{Method: "stats"})
+	check(restartedStats.Error == "" && restartedStats.Datagrams != nil && *restartedStats.Datagrams == (gateway.DatagramStats{}), "process restart retained diagnostics")
+	oldProcessWork, rejected := work(ready.Control, tlsConfig, firstAccepted)
+	check(rejected.Error == "work_rejected", "process restart accepted old work identity")
+	oldProcessWork.Close()
+	restarted.conn.Close()
+	evidence["actualProcessRestartClearsState"] = true
+	evidence["controlReconnectPreservesDiagnostics"] = true
 	evidence["status"] = "passed"
 	return evidence
 }
