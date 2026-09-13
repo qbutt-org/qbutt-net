@@ -48,11 +48,16 @@ jobs:
           go build -trimpath -o bin/qbutt-net.exe ./cmd/qbutt-net
           go build -trimpath -o bin/qbutt-gateway.exe ./cmd/qbutt-gateway
           go build -trimpath -o bin/qbutt-gateway-lab.exe ./scripts/gateway-lab
+          go build -trimpath -o bin/qbutt-gateway-client-lab.exe ./scripts/gateway-client-lab
       - name: Vet
-        run: go vet ./cmd/qbutt-net ./cmd/qbutt-gateway ./component/gateway ./scripts/gateway-lab
+        run: go vet ./cmd/qbutt-net ./cmd/qbutt-gateway ./component/gateway ./scripts/gateway-lab ./scripts/gateway-client-lab
       - name: Integration and fault scenarios
-        run: bun scripts/qbutt-net-integration.ts bin/qbutt-net.exe
+        run: |
+          bun scripts/qbutt-net-integration.ts bin/qbutt-net.exe
+          bun scripts/qbutt-net-dns-integration.ts bin/qbutt-net.exe
       - name: Gateway integration and fault scenarios
-        run: bun scripts/qbutt-gateway-integration.ts bin/qbutt-gateway.exe bin/qbutt-gateway-lab.exe
+        run: |
+          bun scripts/qbutt-gateway-integration.ts bin/qbutt-gateway.exe bin/qbutt-gateway-lab.exe
+          bun scripts/qbutt-net-gateway-client-integration.ts bin/qbutt-net.exe bin/qbutt-gateway.exe bin/qbutt-gateway-client-lab.exe
       - name: Check whitespace
         run: git diff --check

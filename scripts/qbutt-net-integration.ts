@@ -106,7 +106,7 @@ function launch() {
   lines.on("line", line => {
     assert(Buffer.byteLength(line) < 65536);
     const reply = JSON.parse(line);
-    assert.equal(reply.v, 2);
+    assert.equal(reply.v, 3);
     const receive = replies.get(reply.id);
     assert(receive, "response id must match a request");
     replies.delete(reply.id);
@@ -122,7 +122,7 @@ function launch() {
     request(method: string, params: Record<string, unknown> = {}) {
       const requestId = ++id;
       const reply = deadline(new Promise<any>(resolve => replies.set(requestId, resolve)), method);
-      child.stdin.write(JSON.stringify({ v: 2, id: requestId, method, ...params }) + "\n");
+      child.stdin.write(JSON.stringify({ v: 3, id: requestId, method, ...params }) + "\n");
       return reply;
     },
   };

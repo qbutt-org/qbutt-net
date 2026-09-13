@@ -334,8 +334,14 @@ func (s *Server) serveControl(conn net.Conn, first Request, principal [32]byte) 
 				if request.TTLSeconds < 1 || request.TTLSeconds > s.config.MaxTTLSeconds {
 					valid = false
 				} else {
-					current.deadline = time.Now().Add(time.Duration(request.TTLSeconds) * time.Second)
-					current.info.ExpiresUnixMilli = current.deadline.UnixMilli()
+					deadline := time.Now().Add(time.Duration(request.TTLSeconds) * time.Second)
+					expires := deadline.UnixMilli()
+					if expires <= current.info.ExpiresUnixMilli {
+						expires = current.info.ExpiresUnixMilli + 1
+						deadline = time.UnixMilli(expires)
+					}
+					current.deadline = deadline
+					current.info.ExpiresUnixMilli = expires
 					copy := current.info
 					response.Lease = &copy
 				}

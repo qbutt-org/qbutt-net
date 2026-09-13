@@ -122,11 +122,11 @@ for (const [name, lastByte] of [["a", 2], ["b", 3]] as const) {
 const child = spawn(binary, ["--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
 let stderr = ""; child.stderr.on("data", data => { stderr += data; });
 const pending = new Map<number, (reply: any) => void>(); let requestID = 0;
-createInterface({ input: child.stdout }).on("line", line => { const reply = JSON.parse(line); assert.equal(reply.v, 2); pending.get(reply.id)?.(reply); pending.delete(reply.id); });
+createInterface({ input: child.stdout }).on("line", line => { const reply = JSON.parse(line); assert.equal(reply.v, 3); pending.get(reply.id)?.(reply); pending.delete(reply.id); });
 const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
 function request(method: string, fields: object = {}) {
   const id = ++requestID; const promise = deadline(new Promise<any>(resolve => pending.set(id, resolve)), method);
-  child.stdin.write(JSON.stringify({ v: 2, id, method, ...fields }) + "\n"); return promise;
+  child.stdin.write(JSON.stringify({ v: 3, id, method, ...fields }) + "\n"); return promise;
 }
 async function authenticate(endpoint: any) {
   const socket = createConnection(endpoint.port, endpoint.host); const wire = new Wire(socket);
@@ -147,7 +147,7 @@ try {
   await writeFile(configPath, JSON.stringify({ dns: { enable: true, nameserver: [`127.0.0.1:${(rogue.address() as any).port}`] }, hosts: { "same.test": "127.0.0.99" },
     proxies: [...upstreams.map(item => ({ name: item.name, type: "socks5", server: `edge-${item.name}.test`, port: item.port, udp: true, tls: true, "skip-cert-verify": true })),
       { name: "g", type: "gost-relay", server: "127.0.0.1", port: (blackhole.address() as any).port, udp: true }] }));
-  assert.equal((await request("hello")).result.protocol, 2);
+  assert.equal((await request("hello")).result.protocol, 3);
   const params = (id: string, generation = 1, family = "dual") => ({ configPath, proxyName: id.startsWith("a") ? "a" : id, pathId: id, generation, interfaceName,
     dns: { server: dnsAddress, bootstrapServer: bootstrapAddress, family } });
   assert.equal((await request("open", { ...params("a"), dns: undefined })).error.code, "dns_policy_required");
@@ -238,7 +238,7 @@ try {
   assert.equal(await deadline(exited, "EOF during DNS"), 0); assert(Date.now() - start < 6000, "Serial resolve blocked EOF beyond DNS bound");
   assert.equal(stderr, ""); assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, queries: queries.length, tcpVerifiedBytes, udpVerifiedBytes,
-    checks: ["explicit v2 DNS policy", "two-path independent A/AAAA", "TLS server hostname preserved", "numeric IPv4/IPv6 TCP and UDP destinations", "SOCKS unspecified UDP bind bootstrap", "UDP TTL cache, TTL zero and expiry", "bootstrap/destination CNAME and cycle rejection", "localhost resolved through path", "family and generation guards", "NXDOMAIN no fallback", "malformed/truncated/over-limit DNS rejected", "imported rogue DNS unused", "GOST handshake timeout and TCP/UDP close", "pending DNS cancelled by close", "generation cache isolation", "EOF bounded during resolver timeout"] }));
+    checks: ["explicit v3 DNS policy", "two-path independent A/AAAA", "TLS server hostname preserved", "numeric IPv4/IPv6 TCP and UDP destinations", "SOCKS unspecified UDP bind bootstrap", "UDP TTL cache, TTL zero and expiry", "bootstrap/destination CNAME and cycle rejection", "localhost resolved through path", "family and generation guards", "NXDOMAIN no fallback", "malformed/truncated/over-limit DNS rejected", "imported rogue DNS unused", "GOST handshake timeout and TCP/UDP close", "pending DNS cancelled by close", "generation cache isolation", "EOF bounded during resolver timeout"] }));
 } finally {
   if (child.exitCode === null) child.kill();
   for (const socket of sockets) socket.destroy();
