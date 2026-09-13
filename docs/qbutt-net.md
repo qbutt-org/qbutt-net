@@ -27,7 +27,7 @@ The DNS fixture uses two local TLS SOCKS adapters and a separate bootstrap DNS e
 
 The gateway fixture launches and restarts the actual gateway process with generated certificates. It verifies the exact allowed client certificate across control, work and QUIC, the one-tenant limit, listener and connection quotas, TCP backpressure isolation, lease renewal/expiry/replacement, QUIC carrier failure, 1,200-, 1,500- and 65,507-byte UDP datagrams, reordered and duplicate fragments, incomplete-fragment expiry and bounds, aggregate rate limits, reflection rejection and bounded diagnostics. Its listeners are loopback fixtures; it does not claim public reachability through a real firewall or NAT.
 
-The gateway-client fixture launches qbutt-net, qbutt-gateway and a generated selected SOCKS adapter as separate processes. It verifies that TLS control, independent TCP work connections and QUIC datagrams all traverse that adapter; then it transfers TCP and fragmented UDP payloads through the leased loopback endpoint, validates the original peer endpoint, the authenticated local relay, renewal, generation advancement, expiry, path-scoped cleanup and parent-EOF cleanup. This remains a loopback endpoint test and does not claim Internet reachability.
+The gateway-client fixture launches qbutt-net, qbutt-gateway and a generated selected SOCKS adapter as separate processes. It verifies that TLS control, independent TCP work connections and QUIC datagrams all traverse that adapter; then it transfers TCP and fragmented UDP payloads through the leased loopback endpoint, validates the original peer endpoint, four bounded UDP associations, authenticated local relay, counters, renewal and generation advancement. Fault cases cover lease expiry, carrier loss, exact terminal events, stale generation rejection, explicit-close suppression, fail-closed UDP, path cleanup, shutdown and parent EOF. This remains a loopback endpoint test and does not claim Internet reachability.
 
 The optional [manual component workflow](../.github/workflows/qbutt-net.yml) pins the official Windows amd64 [Go toolchain module archive](https://proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.1.windows-amd64.zip) by SHA-256. That archive was verified through Go's `sum.golang.org` database before its hash was pinned; [Go documents this authenticated toolchain distribution](https://go.dev/doc/toolchain). Releases are built and verified locally, then uploaded. The workflow runs only when the user explicitly requests a manual Actions run; pushes and pull requests do not trigger CI.
 
@@ -48,8 +48,8 @@ Launch `qbutt-net.exe --stdio` with private inherited stdin/stdout pipes, for ex
 Each UTF-8 JSON object ends with LF. Maximum frame size including LF is 65,536 bytes. Malformed JSON and oversized frames close every path and exit nonzero. Requests execute in order; `id` and `generation` are positive integers at most 2^53−1. Responses echo the request ID. `hello` must precede every other method. Version mismatch is explicit; no version fallback is attempted.
 
 ```json
-{"v":3,"id":1,"method":"hello"}
-{"v":3,"id":1,"result":{"protocol":3,"name":"qbutt-net","upstreamRevision":"d3ec342d441b086ec4318332f59dd05d8a2b5697","maxFrameBytes":65536}}
+{"v":4,"id":1,"method":"hello"}
+{"v":4,"id":1,"result":{"protocol":4,"name":"qbutt-net","upstreamRevision":"d3ec342d441b086ec4318332f59dd05d8a2b5697","maxFrameBytes":65536}}
 ```
 
 Requests use these fields at the top level:
@@ -73,7 +73,7 @@ Requests use these fields at the top level:
 
 The parent supplies the physical interface by the Go/Windows friendly interface name, such as the Qt `humanReadableName()`. It must exist and be up at open time. The supplied value replaces every imported interface override; imported routing marks are discarded. Adapter connection errors remain errors, without a direct fallback.
 
-Protocol 3 requires an explicit parent-owned DNS policy on every open and adds the optional gateway methods and serialized events; older protocols are rejected. A basic configurable public-resolver default can be supplied by the desktop client:
+Protocol 4 requires an explicit parent-owned DNS policy on every open, path status counters, optional gateway methods and serialized events; older protocols are rejected. A basic configurable public-resolver default can be supplied by the desktop client:
 
 ```json
 {"dns":{"server":"1.1.1.1:53","bootstrapServer":"1.1.1.1:53","family":"dual"}}
@@ -88,17 +88,17 @@ Dynamic ECH discovery, Hysteria2 realm discovery and TLSMirror auxiliary traffic
 An `open` result has this shape (credentials below are illustrative):
 
 ```json
-{"v":3,"id":3,"result":{"pathId":"path-1","generation":1,"interfaceName":"Ethernet","host":"127.0.0.1","port":50000,"socksUsername":"example","socksPassword":"example","capabilities":{"tcp":"supported","udp":"source-supported","dns":"path-tcp","publicTcp":"unknown","publicUdp":"unknown","measurement":"not-probed"}}}
+{"v":4,"id":3,"result":{"pathId":"path-1","generation":1,"interfaceName":"Ethernet","host":"127.0.0.1","port":50000,"socksUsername":"example","socksPassword":"example","capabilities":{"tcp":"supported","udp":"source-supported","dns":"path-tcp","publicTcp":"unknown","publicUdp":"unknown","measurement":"not-probed"}}}
 ```
 
-UDP is `source-supported` or `source-unsupported` according to the adapter's `SupportUDP()`. TCP availability describes the source adapter API. DNS `path-tcp` describes the configured resolver ownership and transport. These fields do not mean a successful connection or verified egress. No health state, public port, latency or loss is invented. The parent detects child process failure; no asynchronous health event exists.
+UDP is `source-supported` or `source-unsupported` according to the adapter's `SupportUDP()`. TCP availability describes the source adapter API. DNS `path-tcp` describes the configured resolver ownership and transport. These fields do not mean a successful connection or verified egress. No health state, public port, latency or loss is invented. The parent detects child process failure; `gatewayClosed` reports only terminal retirement of an installed gateway.
 
 `status` exposes real traffic counters for each active exact path generation. `wire` has exactly `relayDownloadBytes`, `relayUploadBytes`, `carrierDownloadBytes`, `carrierUploadBytes`, `carrierDownloadPackets`, `carrierUploadPackets` and `relayDownloadCopies`. They are unsigned JSON-safe integers: each starts at zero, increases monotonically, saturates at 2^53−1, and disappears when the path closes. A snapshot reads independently updated counters and can straddle concurrent I/O. Download is toward the local SOCKS or inbound-relay client; upload is away from it. Relay byte counters contain payload bytes accepted by the next local socket or carrier API, not end-to-end remote delivery. UDP download bytes are summed across successful local fanout copies, and `relayDownloadCopies` counts those copies. Carrier counters cover only gateway control, work and QUIC connections at the selected adapter's TCP or packet API; they stay zero when no gateway connection has been attempted. They include TLS or QUIC framing visible there but cannot include encapsulation hidden below that API. Carrier packet counters count only successful packet-API reads and writes because TCP packet boundaries are unavailable. These values are traffic diagnostics, not verified payload or reachability measurements, and contain no adapter name, endpoint, error or credential.
 
 Failures use fixed codes and no raw adapter/parser data:
 
 ```json
-{"v":3,"id":4,"error":{"code":"generation_mismatch","message":"generation_mismatch"}}
+{"v":4,"id":4,"error":{"code":"generation_mismatch","message":"generation_mismatch"}}
 ```
 
 Codes include `protocol_mismatch`, `hello_required`, `invalid_request_id`, `unknown_method`, `absolute_config_path_required`, `config_unreadable`, `config_not_regular`, `config_limit`, `invalid_config`, `no_proxies`, `proxy_limit`, `invalid_proxy_identity`, `proxy_not_found`, `unsupported_proxy_type`, `proxy_chain_not_supported`, `external_credentials_not_supported`, `invalid_path`, `path_exists`, `path_not_found`, `path_limit`, `generation_mismatch`, `interface_required`, `interface_unavailable`, `adapter_rejected`, `listener_failed`, `credentials_failed` and `response_limit`.
@@ -127,7 +127,9 @@ qbutt-net accepts `gateway.open` only for an existing exact path generation. Its
 
 Successful open and renew responses contain exactly `pathId`, `generation`, `publicEndpoint`, `tcp`, `udp`, `expiresUnixMilli`, `relayHost` and `relayPort`. Renewal must preserve the gateway lease, public endpoint, transport flags and one stable loopback relay. A replacement requires a later path generation. Closing the gateway retires the public lease, all work connections, pending tickets, QUIC and the relay; closing the path or parent pipe also performs that cleanup.
 
-Each accepted public TCP peer uses one authenticated work connection. Once work authentication succeeds, qbutt-net writes one serialized parent event with `v:3`, `id:0`, `event:"incomingTcp"`, the exact `pathId`, `generation`, numeric `remote`, `publicEndpoint`, `relayHost:"127.0.0.1"`, `relayPort` and a 64-character lowercase `relayToken`. The parent has five seconds to connect to the relay and write 37 bytes: ASCII `QBIN`, byte `1`, then the 32 raw token bytes. Tickets are single-use; at most 64 wait and at most 32 relay handshakes run concurrently.
+Unexpected control, carrier or lease retirement of a published gateway emits exactly one serialized terminal event after internal retirement: `{"v":4,"id":0,"event":"gatewayClosed","pathId":"path-1","generation":1,"reason":"gateway_closed"}`. These are its only six fields, and `gateway_closed` is the only reason value. No `incomingTcp` or successful `gateway.open` or `gateway.renew` response for that generation follows the terminal event. An explicit parent `gateway.close`, path `close`, `shutdown` or parent-pipe EOF emits no such event; shutdown and EOF suppress events for every path before cleanup begins. The parent retires descriptors only when both path ID and generation match its active state; stale or duplicate events have no effect.
+
+Each accepted public TCP peer uses one authenticated work connection. Once work authentication succeeds, qbutt-net writes one serialized parent event with `v:4`, `id:0`, `event:"incomingTcp"`, the exact `pathId`, `generation`, numeric `remote`, `publicEndpoint`, `relayHost:"127.0.0.1"`, `relayPort` and a 64-character lowercase `relayToken`. The parent has five seconds to connect to the relay and write 37 bytes: ASCII `QBIN`, byte `1`, then the 32 raw token bytes. Tickets are single-use; at most 64 wait and at most 32 relay handshakes run concurrently.
 
 For UDP, one path generation owns one public gateway carrier shared by at most four authenticated local SOCKS UDP associations. Outbound payloads from every association use that carrier. Each valid public reply is returned to every active association as an ordinary SOCKS UDP response with the original source endpoint; the application layer owns any protocol demultiplexing. A fifth simultaneous association is rejected. The effective payload limit at this SOCKS boundary is 65,485 bytes, leaving room for the largest numeric IPv6 source envelope inside one legal UDP datagram. An oversized local payload retires only its sending association; an oversized public reply retires every association because none can encode it at this boundary. The gateway carrier itself retains its 65,507-byte transport limit. Starting a UDP gateway retires existing direct UDP associations. Gateway expiry or carrier failure retires all its associations and rejects replacements until the parent advances the path generation, so a lease failure cannot change routes in place. A TCP-only gateway leaves ordinary adapter UDP unchanged. Reflection, rate, replay and reassembly policy stays owned by qbutt-gateway.
 

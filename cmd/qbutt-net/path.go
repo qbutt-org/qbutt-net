@@ -249,6 +249,9 @@ func (p *path) close() {
 	p.cancel()
 	p.listener.Close()
 	gateway := p.gateway
+	if gateway != nil {
+		gateway.parentClose.Store(true)
+	}
 	p.gateway = nil
 	p.gatewayUDPAssociations = make(map[*udpAssociation]struct{})
 	for association := range p.udpAssociations {
@@ -313,10 +316,21 @@ func (p *path) currentGateway() *gatewayClient {
 	return p.gateway
 }
 
-func (p *path) clearGateway(gateway *gatewayClient) {
+func (p *path) gatewayForClose() *gatewayClient {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gateway == nil || p.gateway.isClosed() {
+		return nil
+	}
+	p.gateway.parentClose.Store(true)
+	return p.gateway
+}
+
+func (p *path) clearGateway(gateway *gatewayClient) bool {
 	p.mu.Lock()
 	var associations []*udpAssociation
-	if p.gateway == gateway {
+	installed := p.gateway == gateway
+	if installed {
 		p.gateway = nil
 		for association := range p.gatewayUDPAssociations {
 			associations = append(associations, association)
@@ -327,6 +341,7 @@ func (p *path) clearGateway(gateway *gatewayClient) {
 	for _, association := range associations {
 		association.retire()
 	}
+	return installed
 }
 
 func (p *path) registerUDP(association *udpAssociation) (*gatewayClient, bool) {

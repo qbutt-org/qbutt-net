@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	parentProtocol        = 3
+	parentProtocol        = 4
 	effectiveSOCKSPayload = 65485
 )
 
@@ -351,6 +351,7 @@ type frame struct {
 	RelayHost      string          `json:"relayHost"`
 	RelayPort      int             `json:"relayPort"`
 	RelayToken     string          `json:"relayToken"`
+	Reason         string          `json:"reason"`
 	FieldCount     int             `json:"-"`
 }
 
@@ -410,13 +411,17 @@ func (child *child) read(stdout io.Reader) {
 }
 
 func (child *child) request(method string, fields map[string]any) frame {
+	return child.requestVersion(parentProtocol, method, fields)
+}
+
+func (child *child) requestVersion(version int, method string, fields map[string]any) frame {
 	child.mu.Lock()
 	child.next++
 	id := child.next
 	reply := make(chan frame, 1)
 	child.pending[id] = reply
 	child.mu.Unlock()
-	request := map[string]any{"v": parentProtocol, "id": id, "method": method}
+	request := map[string]any{"v": version, "id": id, "method": method}
 	for key, value := range fields {
 		request[key] = value
 	}
@@ -438,6 +443,14 @@ func (child *child) event() frame {
 		return event
 	case <-time.After(8 * time.Second):
 		panic("qbutt-net event timeout")
+	}
+}
+
+func (child *child) expectNoEvent(wait time.Duration) {
+	select {
+	case event := <-child.events:
+		panic("unexpected qbutt-net event: " + event.Event)
+	case <-time.After(wait):
 	}
 }
 
@@ -514,6 +527,24 @@ func checkMonotonic(before, after wireSnapshot) {
 		after.CarrierDownloadBytes >= before.CarrierDownloadBytes && after.CarrierUploadBytes >= before.CarrierUploadBytes &&
 		after.CarrierDownloadPackets >= before.CarrierDownloadPackets && after.CarrierUploadPackets >= before.CarrierUploadPackets &&
 		after.RelayDownloadCopies >= before.RelayDownloadCopies, "wire counters decreased")
+}
+
+func checkGatewayClosedEvent(event frame, pathID string, generation uint64) {
+	check(event.FieldCount == 6 && event.ID == 0 && event.Event == "gatewayClosed" && event.PathID == pathID &&
+		event.Generation == generation && event.Reason == "gateway_closed", "gatewayClosed event mismatch")
+}
+
+func checkIncomingEvent(event frame, endpoint gatewayEndpoint) []byte {
+	check(event.FieldCount == 10 && event.ID == 0 && event.Event == "incomingTcp" && event.PathID == endpoint.PathID &&
+		event.Generation == endpoint.Generation && event.PublicEndpoint == endpoint.PublicEndpoint &&
+		event.RelayHost == endpoint.RelayHost && event.RelayPort == endpoint.RelayPort, "incoming event mismatch")
+	if _, err := net.ResolveTCPAddr("tcp", event.Remote); err != nil {
+		panic("incoming event remote is not numeric")
+	}
+	token, err := hex.DecodeString(event.RelayToken)
+	must(err)
+	check(len(token) == 32 && event.RelayToken == strings.ToLower(event.RelayToken), "invalid relay token")
+	return token
 }
 
 func decodeEndpoint(response frame) gatewayEndpoint {
@@ -772,8 +803,10 @@ func run() (evidence map[string]any) {
 		}
 		check(child.stderr.Len() == 0, "qbutt-net emitted stderr")
 	}()
+	check(errorCode(child.requestVersion(3, "hello", nil)) == "protocol_mismatch", "legacy v3 handshake admitted")
+	evidence["legacyProtocolRejected"] = true
 	hello := child.request("hello", nil)
-	check(hello.Error == nil, "v3 hello failed")
+	check(hello.Error == nil, "v4 hello failed")
 	pathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "gateway-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	pathEndpoint := decodePathEndpoint(child.request("open", pathFields))
@@ -896,14 +929,10 @@ func run() (evidence map[string]any) {
 	must(err)
 	defer peer.Close()
 	event := child.event()
-	check(event.FieldCount == 10 && event.Event == "incomingTcp" && event.PathID == endpoint.PathID && event.Generation == 1 && event.PublicEndpoint == endpoint.PublicEndpoint &&
-		event.RelayHost == endpoint.RelayHost && event.RelayPort == endpoint.RelayPort, "incoming event mismatch")
+	token := checkIncomingEvent(event, endpoint)
 	remote, err := net.ResolveTCPAddr("tcp", event.Remote)
 	must(err)
 	check(remote.String() == peer.LocalAddr().String(), "original peer address lost")
-	token, err := hex.DecodeString(event.RelayToken)
-	must(err)
-	check(len(token) == 32 && event.RelayToken == strings.ToLower(event.RelayToken), "invalid relay token")
 	badRelay, err := net.DialTimeout("tcp", net.JoinHostPort(endpoint.RelayHost, strconv.Itoa(endpoint.RelayPort)), time.Second)
 	must(err)
 	badPrelude := append([]byte("QBIN\x01"), bytes.Repeat([]byte{0xff}, 32)...)
@@ -968,6 +997,7 @@ func run() (evidence map[string]any) {
 	evidence["stableAuthenticatedRelay"] = true
 	closed := child.request("gateway.close", map[string]any{"pathId": "gateway-path", "generation": 1})
 	check(closed.Error == nil && closed.FieldCount == 3 && string(closed.Result) == "{}", "gateway close result mismatch")
+	child.expectNoEvent(300 * time.Millisecond)
 	for _, association := range udpAssociations {
 		expectEOF(association.control)
 	}
@@ -978,6 +1008,7 @@ func run() (evidence map[string]any) {
 		"same-generation gateway replacement admitted")
 
 	check(child.request("close", map[string]any{"pathId": "gateway-path", "generation": 1}).Error == nil, "first path close failed")
+	child.expectNoEvent(200 * time.Millisecond)
 	check(len(decodeStatus(child.request("status", nil))) == 0, "closed path remained in status")
 	pathFields["generation"] = 2
 	secondPath := decodePathEndpoint(child.request("open", pathFields))
@@ -1002,6 +1033,7 @@ func run() (evidence map[string]any) {
 	tcpOnlyLocal.Close()
 	check(child.request("gateway.close", map[string]any{"pathId": "gateway-path", "generation": 2}).Error == nil, "reconnect close failed")
 	check(child.request("close", map[string]any{"pathId": "gateway-path", "generation": 2}).Error == nil, "second path close failed")
+	child.expectNoEvent(300 * time.Millisecond)
 	expiringGateway := make(map[string]any)
 	for key, value := range baseGateway {
 		expiringGateway[key] = value
@@ -1010,24 +1042,58 @@ func run() (evidence map[string]any) {
 	pathFields["generation"] = 3
 	decodePathEndpoint(child.request("open", pathFields))
 	decodeEndpoint(child.request("gateway.open", map[string]any{"pathId": "gateway-path", "generation": 3, "gateway": expiringGateway}))
+	check(errorCode(child.request("gateway.close", map[string]any{"pathId": "gateway-path", "generation": 2})) == "generation_mismatch",
+		"stale gateway close admitted")
 	time.Sleep(1300 * time.Millisecond)
+	checkGatewayClosedEvent(child.event(), "gateway-path", 3)
+	child.expectNoEvent(300 * time.Millisecond)
 	check(errorCode(child.request("gateway.renew", map[string]any{"pathId": "gateway-path", "generation": 3})) == "gateway_not_open", "expired lease remained active")
 	evidence["renewCloseReconnectExpiry"] = true
 	check(child.request("close", map[string]any{"pathId": "gateway-path", "generation": 3}).Error == nil, "path close failed")
 	evidence["pathScopedCleanup"] = true
 	pathFields["generation"] = 4
 	decodePathEndpoint(child.request("open", pathFields))
-	eofEndpoint := decodeEndpoint(child.request("gateway.open", map[string]any{"pathId": "gateway-path", "generation": 4, "gateway": baseGateway}))
+	activeCloseEndpoint := decodeEndpoint(child.request("gateway.open", map[string]any{"pathId": "gateway-path", "generation": 4, "gateway": baseGateway}))
+	check(child.request("close", map[string]any{"pathId": "gateway-path", "generation": 4}).Error == nil, "active gateway path close failed")
+	child.expectNoEvent(300 * time.Millisecond)
+	expectRefused(activeCloseEndpoint.PublicEndpoint)
+	expectRefused(net.JoinHostPort(activeCloseEndpoint.RelayHost, strconv.Itoa(activeCloseEndpoint.RelayPort)))
+	pathFields["generation"] = 5
+	decodePathEndpoint(child.request("open", pathFields))
+	eofEndpoint := decodeEndpoint(child.request("gateway.open", map[string]any{"pathId": "gateway-path", "generation": 5, "gateway": baseGateway}))
 	must(child.stdin.Close())
 	select {
 	case <-child.done:
 	case <-time.After(5 * time.Second):
 		panic("qbutt-net did not exit after parent EOF")
 	}
+	child.expectNoEvent(10 * time.Millisecond)
 	must(child.command.Wait())
 	expectRefused(eofEndpoint.PublicEndpoint)
 	expectRefused(net.JoinHostPort(eofEndpoint.RelayHost, strconv.Itoa(eofEndpoint.RelayPort)))
 	evidence["parentEOFCleanup"] = true
+
+	shutdownChild := startChild(os.Args[1])
+	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v4 hello failed")
+	shutdownPathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "shutdown-path", "generation": 1,
+		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
+	decodePathEndpoint(shutdownChild.request("open", shutdownPathFields))
+	shutdownEndpoint := decodeEndpoint(shutdownChild.request("gateway.open", map[string]any{"pathId": "shutdown-path", "generation": 1, "gateway": baseGateway}))
+	shutdown := shutdownChild.request("shutdown", nil)
+	check(shutdown.Error == nil && shutdown.FieldCount == 3 && string(shutdown.Result) == "{}", "shutdown result mismatch")
+	shutdownChild.expectNoEvent(300 * time.Millisecond)
+	select {
+	case <-shutdownChild.done:
+	case <-time.After(5 * time.Second):
+		shutdownChild.command.Process.Kill()
+		<-shutdownChild.done
+		panic("qbutt-net did not exit after shutdown")
+	}
+	shutdownChild.expectNoEvent(10 * time.Millisecond)
+	must(shutdownChild.command.Wait())
+	check(shutdownChild.stderr.Len() == 0, "shutdown qbutt-net emitted stderr")
+	expectRefused(shutdownEndpoint.PublicEndpoint)
+	evidence["explicitCloseSuppressedEvent"] = true
 
 	failureChild := startChild(os.Args[1])
 	defer func() {
@@ -1043,11 +1109,11 @@ func run() (evidence map[string]any) {
 		}
 		check(failureChild.stderr.Len() == 0, "failure qbutt-net emitted stderr")
 	}()
-	check(failureChild.request("hello", nil).Error == nil, "failure v3 hello failed")
+	check(failureChild.request("hello", nil).Error == nil, "failure v4 hello failed")
 	failurePathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "failure-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	failurePath := decodePathEndpoint(failureChild.request("open", failurePathFields))
-	decodeEndpoint(failureChild.request("gateway.open", map[string]any{"pathId": "failure-path", "generation": 1, "gateway": baseGateway}))
+	failureGateway := decodeEndpoint(failureChild.request("gateway.open", map[string]any{"pathId": "failure-path", "generation": 1, "gateway": baseGateway}))
 	failureAssociations := make([]udpFixtureAssociation, 4)
 	for index := range failureAssociations {
 		failureAssociations[index].control, failureAssociations[index].local, failureAssociations[index].relay = openAuthenticatedUDP(failurePath)
@@ -1060,7 +1126,33 @@ func run() (evidence map[string]any) {
 	must(err)
 	defer fallbackPeer.Close()
 	check(proxy.countUDP(fallbackPeer.LocalAddr().String()) == 0, "fallback target used before carrier failure")
+	pendingPeer, err := net.DialTimeout("tcp", failureGateway.PublicEndpoint, 2*time.Second)
+	must(err)
+	defer pendingPeer.Close()
+	checkIncomingEvent(failureChild.event(), failureGateway)
+	concurrentDials := make(chan net.Conn, 4)
+	for index := 0; index < 4; index++ {
+		go func() {
+			connection, _ := net.DialTimeout("tcp", failureGateway.PublicEndpoint, time.Second)
+			concurrentDials <- connection
+		}()
+	}
+	beforeFailure := pathWire(failureChild, "failure-path", 1)
+	failureStarted := time.Now()
 	must(gatewayStdin.Close())
+	incomingBeforeTerminal := 1
+	for {
+		event := failureChild.event()
+		if event.Event == "incomingTcp" {
+			checkIncomingEvent(event, failureGateway)
+			incomingBeforeTerminal++
+			continue
+		}
+		checkGatewayClosedEvent(event, "failure-path", 1)
+		break
+	}
+	eventLatency := time.Since(failureStarted)
+	check(eventLatency < 3*time.Second, "gatewayClosed event was delayed")
 	select {
 	case err := <-gatewayDone:
 		gatewayStopped = true
@@ -1071,6 +1163,15 @@ func run() (evidence map[string]any) {
 		gatewayStopped = true
 		panic("gateway carrier shutdown timeout")
 	}
+	for index := 0; index < 4; index++ {
+		if connection := <-concurrentDials; connection != nil {
+			connection.Close()
+		}
+	}
+	failureChild.expectNoEvent(300 * time.Millisecond)
+	expectEOF(pendingPeer)
+	afterFailure := pathWire(failureChild, "failure-path", 1)
+	checkMonotonic(beforeFailure, afterFailure)
 	for _, association := range failureAssociations {
 		expectEOF(association.control)
 		_ = writeSOCKSDatagram(association.local, association.relay, fallbackPeer.LocalAddr().String(), []byte("must-not-fall-open"))
@@ -1091,6 +1192,9 @@ func run() (evidence map[string]any) {
 	evidence["udpAssociationsFailClosed"] = true
 	evidence["udpMultiplexBounded"] = true
 	evidence["wireCounters"] = true
+	evidence["gatewayClosedExactlyOnce"] = true
+	evidence["gatewayClosedLatencyMillis"] = eventLatency.Milliseconds()
+	evidence["terminalAfterIncomingTcp"] = incomingBeforeTerminal >= 1
 	evidence["loopbackPublicEndpointProven"] = true
 	evidence["status"] = "passed"
 	return evidence

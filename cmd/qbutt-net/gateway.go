@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -59,6 +60,15 @@ type incomingTCPEvent struct {
 	RelayToken     string `json:"relayToken"`
 }
 
+type gatewayClosedEvent struct {
+	Version    int    `json:"v"`
+	ID         uint64 `json:"id"`
+	Event      string `json:"event"`
+	PathID     string `json:"pathId"`
+	Generation uint64 `json:"generation"`
+	Reason     string `json:"reason"`
+}
+
 type relayTicket struct {
 	work    net.Conn
 	expires time.Time
@@ -81,18 +91,21 @@ type gatewayClient struct {
 	ready      chan struct{}
 	workSlots  chan struct{}
 
-	writeMu      sync.Mutex
-	datagramMu   sync.Mutex
-	mu           sync.Mutex
-	nextID       uint64
-	nextDatagram uint64
-	pending      map[uint64]chan gateway.Response
-	tickets      map[[32]byte]*relayTicket
-	active       map[io.Closer]struct{}
-	closed       bool
-	readyOnce    sync.Once
-	closeOnce    sync.Once
-	wg           sync.WaitGroup
+	writeMu       sync.Mutex
+	datagramMu    sync.Mutex
+	mu            sync.Mutex
+	nextID        uint64
+	nextDatagram  uint64
+	pending       map[uint64]chan gateway.Response
+	tickets       map[[32]byte]*relayTicket
+	active        map[io.Closer]struct{}
+	closed        bool
+	parentClose   atomic.Bool
+	publicationMu sync.Mutex
+	openPublished bool
+	readyOnce     sync.Once
+	closeOnce     sync.Once
+	wg            sync.WaitGroup
 }
 
 type pathOwnedConn struct {
@@ -405,7 +418,7 @@ func (client *gatewayClient) acceptLease(lease gateway.LeaseInfo) bool {
 	lease.Endpoint = endpoint
 	client.mu.Lock()
 	current := client.lease
-	if current.Lease != "" && (lease.Lease != current.Lease || lease.Endpoint != current.Endpoint || lease.TCP != current.TCP ||
+	if client.closed || current.Lease != "" && (lease.Lease != current.Lease || lease.Endpoint != current.Endpoint || lease.TCP != current.TCP ||
 		lease.UDP != current.UDP || lease.ExpiresUnixMilli <= current.ExpiresUnixMilli) {
 		client.mu.Unlock()
 		return false
@@ -436,8 +449,21 @@ func (client *gatewayClient) hasUDP() bool {
 	return !client.closed && client.lease.UDP && client.datagrams != nil
 }
 
-func (client *gatewayClient) activate() {
-	client.readyOnce.Do(func() { close(client.ready) })
+func (client *gatewayClient) publishResponse(reply *response, failureCode string, opens bool) error {
+	client.publicationMu.Lock()
+	defer client.publicationMu.Unlock()
+	if reply.Error == nil && client.isClosed() {
+		reply.Result = nil
+		reply.Error = failure(failureCode)
+	}
+	err := client.output.write(*reply, reply.ID)
+	if opens {
+		client.readyOnce.Do(func() {
+			client.openPublished = err == nil && reply.Error == nil
+			close(client.ready)
+		})
+	}
+	return err
 }
 
 func (client *gatewayClient) request(ctx context.Context, request gateway.Request) (gateway.Response, error) {
@@ -824,7 +850,17 @@ func (client *gatewayClient) retire() {
 		for closer := range active {
 			closer.Close()
 		}
-		client.path.clearGateway(client)
+		installed := client.path.clearGateway(client)
+		if !installed {
+			return
+		}
+		<-client.ready
+		client.publicationMu.Lock()
+		defer client.publicationMu.Unlock()
+		if client.openPublished && !client.parentClose.Load() && !client.output.closing.Load() {
+			client.output.write(gatewayClosedEvent{Version: protocolVersion, ID: 0, Event: "gatewayClosed",
+				PathID: client.pathID, Generation: client.generation, Reason: "gateway_closed"}, 0)
+		}
 	})
 }
 
@@ -846,15 +882,16 @@ func (client *gatewayClient) addTicket(work net.Conn, remote string) bool {
 	client.tickets[token] = ticket
 	client.active[work] = struct{}{}
 	lease := client.lease
-	client.mu.Unlock()
 	event := incomingTCPEvent{Version: protocolVersion, ID: 0, Event: "incomingTcp", PathID: client.pathID,
 		Generation: client.generation, Remote: remote, PublicEndpoint: lease.Endpoint, RelayHost: "127.0.0.1",
 		RelayPort: client.relay.Addr().(*net.TCPAddr).Port, RelayToken: hex.EncodeToString(token[:])}
-	if client.output.write(event, 0) != nil {
-		client.mu.Lock()
+	writeError := client.output.write(event, 0)
+	if writeError != nil {
 		delete(client.tickets, token)
 		delete(client.active, work)
-		client.mu.Unlock()
+	}
+	client.mu.Unlock()
+	if writeError != nil {
 		client.retire()
 		return false
 	}

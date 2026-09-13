@@ -106,7 +106,7 @@ function launch() {
   lines.on("line", line => {
     assert(Buffer.byteLength(line) < 65536);
     const reply = JSON.parse(line);
-    assert.equal(reply.v, 3);
+    assert.equal(reply.v, 4);
     const receive = replies.get(reply.id);
     assert(receive, "response id must match a request");
     replies.delete(reply.id);
@@ -122,7 +122,7 @@ function launch() {
     request(method: string, params: Record<string, unknown> = {}) {
       const requestId = ++id;
       const reply = deadline(new Promise<any>(resolve => replies.set(requestId, resolve)), method);
-      child.stdin.write(JSON.stringify({ v: 3, id: requestId, method, ...params }) + "\n");
+      child.stdin.write(JSON.stringify({ v: 4, id: requestId, method, ...params }) + "\n");
       return reply;
     },
   };
@@ -162,7 +162,10 @@ try {
   const child = childProcess();
   assert.equal((await child.request("list", { configPath })).error.code, "hello_required");
   assert.equal((await child.request("hello", { v: 1 })).error.code, "protocol_mismatch");
-  assert.equal((await child.request("hello")).result.upstreamRevision, "d3ec342d441b086ec4318332f59dd05d8a2b5697");
+  assert.equal((await child.request("hello", { v: 3 })).error.code, "protocol_mismatch");
+  const hello = (await child.request("hello")).result;
+  assert.equal(hello.protocol, 4);
+  assert.equal(hello.upstreamRevision, "d3ec342d441b086ec4318332f59dd05d8a2b5697");
   assert.deepEqual((await child.request("status")).result, { paths: [] });
   assert.equal((await child.request("list", { configPath })).result.proxies.length, 3);
   const boundedConfig = join(temporary, "bounds.yaml");

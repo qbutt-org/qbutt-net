@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	mierulog "github.com/enfein/mieru/v3/pkg/log"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	protocolVersion  = 3
+	protocolVersion  = 4
 	maxFrameBytes    = 65536
 	upstreamRevision = "d3ec342d441b086ec4318332f59dd05d8a2b5697"
 )
@@ -50,7 +51,8 @@ type controlError struct {
 }
 
 type controlWriter struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	closing atomic.Bool
 }
 
 func (writer *controlWriter) write(value any, id uint64) error {
@@ -100,6 +102,7 @@ func run() error {
 	paths := make(map[string]*path)
 	output := &controlWriter{}
 	defer func() {
+		output.closing.Store(true)
 		for _, p := range paths {
 			p.close()
 		}
@@ -113,7 +116,9 @@ func run() error {
 			return err
 		}
 		reply := response{Version: protocolVersion, ID: req.ID}
-		var activate *gatewayClient
+		var publication *gatewayClient
+		publicationFailure := ""
+		publishesOpen := false
 		switch {
 		case req.Version != protocolVersion:
 			reply.Error = failure("protocol_mismatch")
@@ -212,7 +217,9 @@ func run() error {
 				break
 			}
 			reply.Result = gateway.endpoint()
-			activate = gateway
+			publication = gateway
+			publicationFailure = "gateway_lease_rejected"
+			publishesOpen = true
 		case req.Method == "gateway.renew":
 			p, exists := paths[req.PathID]
 			if !exists {
@@ -234,6 +241,8 @@ func run() error {
 				break
 			}
 			reply.Result = result
+			publication = gateway
+			publicationFailure = "gateway_renew_failed"
 		case req.Method == "gateway.close":
 			p, exists := paths[req.PathID]
 			if !exists {
@@ -244,7 +253,7 @@ func run() error {
 				reply.Error = failure("generation_mismatch")
 				break
 			}
-			gateway := p.currentGateway()
+			gateway := p.gatewayForClose()
 			if gateway == nil {
 				reply.Error = failure("gateway_not_open")
 				break
@@ -270,6 +279,7 @@ func run() error {
 			delete(paths, req.PathID)
 			reply.Result = struct{}{}
 		case req.Method == "shutdown":
+			output.closing.Store(true)
 			for id, p := range paths {
 				p.close()
 				delete(paths, id)
@@ -278,11 +288,14 @@ func run() error {
 		default:
 			reply.Error = failure("unknown_method")
 		}
-		if err := output.write(reply, req.ID); err != nil {
-			return err
+		var writeError error
+		if publication != nil {
+			writeError = publication.publishResponse(&reply, publicationFailure, publishesOpen)
+		} else {
+			writeError = output.write(reply, req.ID)
 		}
-		if activate != nil {
-			activate.activate()
+		if writeError != nil {
+			return writeError
 		}
 		if req.Method == "shutdown" && reply.Error == nil {
 			return nil
