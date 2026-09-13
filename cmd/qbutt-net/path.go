@@ -18,27 +18,31 @@ import (
 	"github.com/metacubex/mihomo/transport/socks5"
 )
 
-// The SOCKS UDP response adds 22 bytes for RSV, FRAG and a numeric IPv6 source.
-const maxGatewaySOCKSUDPPayload = 65485
+const (
+	// The SOCKS UDP response adds 22 bytes for RSV, FRAG and a numeric IPv6 source.
+	maxGatewaySOCKSUDPPayload = 65485
+	maxGatewayUDPAssociations = 4
+)
 
 type path struct {
-	proxy              C.Proxy
-	resolver           *pathResolver
-	listener           net.Listener
-	generation         uint64
-	username           string
-	password           string
-	ctx                context.Context
-	cancel             context.CancelFunc
-	mu                 sync.Mutex
-	connections        map[io.Closer]struct{}
-	gateway            *gatewayClient
-	gatewayUDP         *udpAssociation
-	udpAssociations    map[*udpAssociation]struct{}
-	installingGateway  bool
-	udpGatewayReserved bool
-	closing            bool
-	wg                 sync.WaitGroup
+	proxy                  C.Proxy
+	resolver               *pathResolver
+	listener               net.Listener
+	generation             uint64
+	username               string
+	password               string
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	mu                     sync.Mutex
+	connections            map[io.Closer]struct{}
+	gateway                *gatewayClient
+	gatewayUDPAssociations map[*udpAssociation]struct{}
+	udpAssociations        map[*udpAssociation]struct{}
+	installingGateway      bool
+	udpGatewayReserved     bool
+	wire                   wireCounters
+	closing                bool
+	wg                     sync.WaitGroup
 }
 
 type udpAssociation struct {
@@ -147,7 +151,7 @@ func openPath(req request) (*path, *controlError) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &path{generation: req.Generation, ctx: ctx, cancel: cancel, connections: make(map[io.Closer]struct{}),
-		udpAssociations: make(map[*udpAssociation]struct{})}
+		udpAssociations: make(map[*udpAssociation]struct{}), gatewayUDPAssociations: make(map[*udpAssociation]struct{})}
 	opened := false
 	defer func() {
 		if !opened {
@@ -246,7 +250,7 @@ func (p *path) close() {
 	p.listener.Close()
 	gateway := p.gateway
 	p.gateway = nil
-	p.gatewayUDP = nil
+	p.gatewayUDPAssociations = make(map[*udpAssociation]struct{})
 	for association := range p.udpAssociations {
 		association.retire()
 	}
@@ -311,14 +315,16 @@ func (p *path) currentGateway() *gatewayClient {
 
 func (p *path) clearGateway(gateway *gatewayClient) {
 	p.mu.Lock()
-	var association *udpAssociation
+	var associations []*udpAssociation
 	if p.gateway == gateway {
 		p.gateway = nil
-		association = p.gatewayUDP
-		p.gatewayUDP = nil
+		for association := range p.gatewayUDPAssociations {
+			associations = append(associations, association)
+		}
+		p.gatewayUDPAssociations = make(map[*udpAssociation]struct{})
 	}
 	p.mu.Unlock()
-	if association != nil {
+	for _, association := range associations {
 		association.retire()
 	}
 }
@@ -330,11 +336,11 @@ func (p *path) registerUDP(association *udpAssociation) (*gatewayClient, bool) {
 		return nil, false
 	}
 	if p.udpGatewayReserved {
-		if p.gateway == nil || !p.gateway.hasUDP() || p.gatewayUDP != nil {
+		if p.gateway == nil || !p.gateway.hasUDP() || len(p.gatewayUDPAssociations) >= maxGatewayUDPAssociations {
 			return nil, false
 		}
 		p.udpAssociations[association] = struct{}{}
-		p.gatewayUDP = association
+		p.gatewayUDPAssociations[association] = struct{}{}
 		return p.gateway, true
 	}
 	p.udpAssociations[association] = struct{}{}
@@ -344,21 +350,29 @@ func (p *path) registerUDP(association *udpAssociation) (*gatewayClient, bool) {
 func (p *path) releaseUDP(association *udpAssociation) {
 	p.mu.Lock()
 	delete(p.udpAssociations, association)
-	if p.gatewayUDP == association {
-		p.gatewayUDP = nil
-	}
+	delete(p.gatewayUDPAssociations, association)
 	p.mu.Unlock()
 }
 
-func (p *path) deliverGatewayUDP(source netip.AddrPort, payload []byte) bool {
+func (p *path) deliverGatewayUDP(source netip.AddrPort, payload []byte) {
 	p.mu.Lock()
-	association := p.gatewayUDP
-	p.mu.Unlock()
-	if association != nil && len(payload) > maxGatewaySOCKSUDPPayload {
-		association.retire()
-		return false
+	associations := make([]*udpAssociation, 0, len(p.gatewayUDPAssociations))
+	for association := range p.gatewayUDPAssociations {
+		associations = append(associations, association)
 	}
-	return association != nil && association.deliver(source, payload)
+	p.mu.Unlock()
+	if len(payload) > maxGatewaySOCKSUDPPayload {
+		for _, association := range associations {
+			association.retire()
+		}
+		return
+	}
+	for _, association := range associations {
+		if association.deliver(source, payload) {
+			p.wire.relayDownloadBytes.add(len(payload))
+			p.wire.relayDownloadCopies.increment()
+		}
+	}
 }
 
 func (p *path) accept() {
@@ -454,7 +468,9 @@ func (p *path) serve(c net.Conn) {
 			return
 		}
 		c.SetDeadline(time.Time{})
-		N.Relay(c, remote)
+		local := newCountedConn(c, nil, &p.wire.relayDownloadBytes)
+		outbound := newCountedConn(remote, nil, &p.wire.relayUploadBytes)
+		N.Relay(local, outbound)
 	case socks5.CmdUDPAssociate:
 		if !p.proxy.SupportUDP() {
 			replySOCKS(c, byte(socks5.ErrCommandNotSupported), nil)
@@ -506,15 +522,16 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 		replySOCKS(c, byte(socks5.ErrConnectionNotAllowed), nil)
 		return
 	}
+	done := make(chan struct{})
+	defer func() { c.Close(); <-done }()
 	defer association.retire()
 	defer p.releaseUDP(association)
 	if !replySOCKS(c, 0, local.LocalAddr()) {
+		close(done)
 		return
 	}
 	c.SetDeadline(time.Time{})
-	done := make(chan struct{})
 	go func() { io.Copy(io.Discard, c); local.Close(); close(done) }()
-	defer func() { c.Close(); <-done }()
 	var remote C.PacketConn
 	var readDone chan struct{}
 	defer func() {
@@ -593,10 +610,14 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 					if _, err := local.WriteToUDP(packet, client); err != nil {
 						return
 					}
+					p.wire.relayDownloadBytes.add(n)
+					p.wire.relayDownloadCopies.increment()
 				}
 			}()
 		}
-		if _, err := remote.WriteTo(payload, metadata.UDPAddr()); err != nil {
+		written, err := remote.WriteTo(payload, metadata.UDPAddr())
+		p.wire.relayUploadBytes.add(written)
+		if err != nil {
 			association.endDirect()
 			return
 		}

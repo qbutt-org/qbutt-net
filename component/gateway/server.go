@@ -90,6 +90,8 @@ type lease struct {
 	active   bool
 }
 
+const ephemeralLeaseAttempts = 16
+
 type peer struct {
 	incoming net.Conn
 	work     net.Conn
@@ -415,26 +417,10 @@ func (owner *session) acquire(request Request) (*LeaseInfo, string) {
 		previous.close()
 	}
 	current := &lease{owner: owner, done: make(chan struct{}), peers: make(map[uint64]*peer), remote: make(map[netip.AddrPort]time.Time)}
-	port := request.Port
-	address := net.JoinHostPort(s.config.ListenerIP, strconv.Itoa(int(port)))
-	var err error
-	if request.TCP {
-		current.tcp, err = net.Listen("tcp", address)
-		if err != nil {
-			return nil, "listener_failed"
-		}
-		port = uint16(current.tcp.Addr().(*net.TCPAddr).Port)
-	}
-	if request.UDP {
-		udpAddress, _ := net.ResolveUDPAddr("udp", net.JoinHostPort(s.config.ListenerIP, strconv.Itoa(int(port))))
-		current.udp, err = net.ListenUDP("udp", udpAddress)
-		if err != nil {
-			if current.tcp != nil {
-				current.tcp.Close()
-			}
-			return nil, "listener_failed"
-		}
-		port = uint16(current.udp.LocalAddr().(*net.UDPAddr).Port)
+	var port uint16
+	current.tcp, current.udp, port = listenLease(s.config.ListenerIP, request.Port, request.TCP, request.UDP)
+	if port == 0 {
+		return nil, "listener_failed"
 	}
 	leaseID, tokenErr := token()
 	if tokenErr != nil {
@@ -475,6 +461,42 @@ func (owner *session) acquire(request Request) (*LeaseInfo, string) {
 	s.mu.Unlock()
 	copy := current.info
 	return &copy, ""
+}
+
+func listenLease(listenerIP string, requestedPort uint16, tcpEnabled, udpEnabled bool) (net.Listener, *net.UDPConn, uint16) {
+	attempts := 1
+	if requestedPort == 0 && tcpEnabled && udpEnabled {
+		attempts = ephemeralLeaseAttempts
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		port := requestedPort
+		var tcpListener net.Listener
+		if tcpEnabled {
+			address := net.JoinHostPort(listenerIP, strconv.Itoa(int(port)))
+			var err error
+			tcpListener, err = net.Listen("tcp", address)
+			if err != nil {
+				return nil, nil, 0
+			}
+			port = uint16(tcpListener.Addr().(*net.TCPAddr).Port)
+		}
+		if udpEnabled {
+			udpAddress, _ := net.ResolveUDPAddr("udp", net.JoinHostPort(listenerIP, strconv.Itoa(int(port))))
+			udpListener, err := net.ListenUDP("udp", udpAddress)
+			if err != nil {
+				if tcpListener != nil {
+					tcpListener.Close()
+				}
+				if attempts > 1 {
+					continue
+				}
+				return nil, nil, 0
+			}
+			return tcpListener, udpListener, uint16(udpListener.LocalAddr().(*net.UDPAddr).Port)
+		}
+		return tcpListener, nil, port
+	}
+	return nil, nil, 0
 }
 
 func (current *lease) close() {

@@ -349,10 +349,11 @@ func (p *path) gatewayTCP(ctx context.Context, address string) (net.Conn, error)
 	if err != nil {
 		return nil, err
 	}
-	if !p.track(conn) {
+	counted := newCountedConn(conn, &p.wire.carrierDownloadBytes, &p.wire.carrierUploadBytes)
+	if !p.track(counted) {
 		return nil, errors.New("path_closed")
 	}
-	return &pathOwnedConn{Conn: conn, owner: p}, nil
+	return &pathOwnedConn{Conn: counted, owner: p}, nil
 }
 
 func (p *path) gatewayPacket(ctx context.Context, address string) (net.PacketConn, netip.AddrPort, error) {
@@ -368,10 +369,13 @@ func (p *path) gatewayPacket(ctx context.Context, address string) (net.PacketCon
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	if !p.track(packetConn) {
+	counted := &countedPacketConn{PacketConn: packetConn, downloadBytes: &p.wire.carrierDownloadBytes,
+		uploadBytes: &p.wire.carrierUploadBytes, downloadPackets: &p.wire.carrierDownloadPackets,
+		uploadPackets: &p.wire.carrierUploadPackets}
+	if !p.track(counted) {
 		return nil, netip.AddrPort{}, errors.New("path_closed")
 	}
-	return &pathOwnedPacketConn{PacketConn: packetConn, owner: p}, destination, nil
+	return &pathOwnedPacketConn{PacketConn: counted, owner: p}, destination, nil
 }
 
 func validGatewayToken(value string) bool {
@@ -557,6 +561,7 @@ func (client *gatewayClient) sendDatagram(remote netip.AddrPort, payload []byte)
 			return false
 		}
 	}
+	client.path.wire.relayUploadBytes.add(len(payload))
 	return true
 }
 
@@ -696,7 +701,9 @@ func (client *gatewayClient) serveRelay(conn net.Conn) {
 	}
 	defer client.releaseActive(ticket.work)
 	conn.SetDeadline(time.Time{})
-	N.Relay(conn, ticket.work)
+	local := newCountedConn(conn, nil, &client.path.wire.relayDownloadBytes)
+	work := newCountedConn(ticket.work, nil, &client.path.wire.relayUploadBytes)
+	N.Relay(local, work)
 }
 
 func (client *gatewayClient) takeTicket(prelude []byte) *relayTicket {

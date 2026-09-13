@@ -459,6 +459,63 @@ type pathEndpoint struct {
 	SocksPassword string `json:"socksPassword"`
 }
 
+type wireSnapshot struct {
+	RelayDownloadBytes     uint64 `json:"relayDownloadBytes"`
+	RelayUploadBytes       uint64 `json:"relayUploadBytes"`
+	CarrierDownloadBytes   uint64 `json:"carrierDownloadBytes"`
+	CarrierUploadBytes     uint64 `json:"carrierUploadBytes"`
+	CarrierDownloadPackets uint64 `json:"carrierDownloadPackets"`
+	CarrierUploadPackets   uint64 `json:"carrierUploadPackets"`
+	RelayDownloadCopies    uint64 `json:"relayDownloadCopies"`
+}
+
+type pathStatus struct {
+	PathID     string       `json:"pathId"`
+	Generation uint64       `json:"generation"`
+	Wire       wireSnapshot `json:"wire"`
+}
+
+func decodeStatus(response frame) []pathStatus {
+	check(response.Error == nil, "status failed: "+errorCode(response))
+	var resultFields map[string]json.RawMessage
+	must(json.Unmarshal(response.Result, &resultFields))
+	check(len(resultFields) == 1 && resultFields["paths"] != nil, "status result fields mismatch")
+	var rawPaths []json.RawMessage
+	must(json.Unmarshal(resultFields["paths"], &rawPaths))
+	paths := make([]pathStatus, len(rawPaths))
+	for index, rawPath := range rawPaths {
+		var fields map[string]json.RawMessage
+		must(json.Unmarshal(rawPath, &fields))
+		check(len(fields) == 3 && fields["pathId"] != nil && fields["generation"] != nil && fields["wire"] != nil, "path status fields mismatch")
+		var wireFields map[string]json.RawMessage
+		must(json.Unmarshal(fields["wire"], &wireFields))
+		for _, name := range []string{"relayDownloadBytes", "relayUploadBytes", "carrierDownloadBytes", "carrierUploadBytes", "carrierDownloadPackets", "carrierUploadPackets", "relayDownloadCopies"} {
+			check(wireFields[name] != nil, "wire status missing "+name)
+		}
+		check(len(wireFields) == 7, "wire status has unknown fields")
+		must(json.Unmarshal(rawPath, &paths[index]))
+	}
+	return paths
+}
+
+func pathWire(child *child, pathID string, generation uint64) wireSnapshot {
+	paths := decodeStatus(child.request("status", nil))
+	for _, path := range paths {
+		if path.PathID == pathID {
+			check(path.Generation == generation, "status generation mismatch")
+			return path.Wire
+		}
+	}
+	panic("status path missing")
+}
+
+func checkMonotonic(before, after wireSnapshot) {
+	check(after.RelayDownloadBytes >= before.RelayDownloadBytes && after.RelayUploadBytes >= before.RelayUploadBytes &&
+		after.CarrierDownloadBytes >= before.CarrierDownloadBytes && after.CarrierUploadBytes >= before.CarrierUploadBytes &&
+		after.CarrierDownloadPackets >= before.CarrierDownloadPackets && after.CarrierUploadPackets >= before.CarrierUploadPackets &&
+		after.RelayDownloadCopies >= before.RelayDownloadCopies, "wire counters decreased")
+}
+
 func decodeEndpoint(response frame) gatewayEndpoint {
 	check(response.Error == nil, "gateway operation failed: "+errorCode(response))
 	var fields map[string]json.RawMessage
@@ -525,6 +582,27 @@ func expectUDPAssociateRejected(endpoint pathEndpoint) {
 	control, status, _ := requestAuthenticatedUDP(endpoint)
 	control.Close()
 	check(status == 2, "SOCKS UDP association was not rejected")
+}
+
+func expectBadAuthentication(endpoint pathEndpoint) {
+	control, err := net.DialTimeout("tcp", net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port)), time.Second)
+	must(err)
+	defer control.Close()
+	control.SetDeadline(time.Now().Add(3 * time.Second))
+	_, err = control.Write([]byte{5, 1, 2})
+	must(err)
+	var reply [2]byte
+	_, err = io.ReadFull(control, reply[:])
+	must(err)
+	check(reply == [2]byte{5, 2}, "SOCKS authentication method mismatch")
+	auth := append([]byte{1, byte(len(endpoint.SocksUsername))}, endpoint.SocksUsername...)
+	auth = append(auth, byte(len("wrong-password")))
+	auth = append(auth, "wrong-password"...)
+	_, err = control.Write(auth)
+	must(err)
+	_, err = io.ReadFull(control, reply[:])
+	must(err)
+	check(reply == [2]byte{1, 1}, "bad SOCKS authentication admitted")
 }
 
 func sendSOCKSDatagram(local *net.UDPConn, relay *net.UDPAddr, target string, payload []byte) {
@@ -699,6 +777,7 @@ func run() (evidence map[string]any) {
 	pathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "gateway-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	pathEndpoint := decodePathEndpoint(child.request("open", pathFields))
+	check(pathWire(child, "gateway-path", 1) == (wireSnapshot{}), "new path counters were not zero")
 	baseGateway := map[string]any{"controlAddress": net.JoinHostPort("gateway.test", strings.Split(ready.Control, ":")[1]),
 		"datagramAddress": ready.Datagrams, "serverName": "127.0.0.1", "caPath": paths["ca"], "certificatePath": paths["client"],
 		"privateKeyPath": paths["clientKey"], "port": 0, "tcp": true, "udp": true, "ttlSeconds": 10}
@@ -728,34 +807,91 @@ func run() (evidence map[string]any) {
 	immediateRenewal := decodeEndpoint(child.request("gateway.renew", map[string]any{"pathId": "gateway-path", "generation": 1}))
 	check(immediateRenewal.ExpiresUnixMilli > endpoint.ExpiresUnixMilli && immediateRenewal.PublicEndpoint == endpoint.PublicEndpoint &&
 		immediateRenewal.RelayHost == endpoint.RelayHost && immediateRenewal.RelayPort == endpoint.RelayPort, "immediate renew did not advance expiry")
-	udpControl, udpLocal, udpRelay := openAuthenticatedUDP(pathEndpoint)
-	defer udpControl.Close()
-	defer udpLocal.Close()
+	type udpFixtureAssociation struct {
+		control net.Conn
+		local   *net.UDPConn
+		relay   *net.UDPAddr
+	}
+	udpAssociations := make([]udpFixtureAssociation, 4)
+	for index := range udpAssociations {
+		udpAssociations[index].control, udpAssociations[index].local, udpAssociations[index].relay = openAuthenticatedUDP(pathEndpoint)
+		defer udpAssociations[index].control.Close()
+		defer udpAssociations[index].local.Close()
+	}
+	expectUDPAssociateRejected(pathEndpoint)
+	expectBadAuthentication(pathEndpoint)
 	publicUDP, err := net.ResolveUDPAddr("udp", endpoint.PublicEndpoint)
 	must(err)
 	peerUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	must(err)
 	defer peerUDP.Close()
-	// The first outbound packet claims this authenticated local association. The
-	// gateway intentionally drops it until the public peer endpoint is observed.
-	sendSOCKSDatagram(udpLocal, udpRelay, "127.0.0.1:9", []byte("association-prime"))
+	// Each opaque association learns its authenticated local endpoint. The
+	// gateway intentionally drops these until a public peer is observed.
+	for index, association := range udpAssociations {
+		sendSOCKSDatagram(association.local, association.relay, "127.0.0.1:9", []byte(fmt.Sprintf("association-prime-%d", index)))
+	}
+	beforeInbound := pathWire(child, "gateway-path", 1)
 	inboundUDP := bytes.Repeat([]byte{0xa5}, effectiveSOCKSPayload)
 	_, err = peerUDP.WriteToUDP(inboundUDP, publicUDP)
 	must(err)
-	udpSource, receivedUDP := readSOCKSDatagram(udpLocal)
-	check(udpSource == peerUDP.LocalAddr().String() && bytes.Equal(receivedUDP, inboundUDP), "public UDP inbound mismatch")
-	outboundUDP := bytes.Repeat([]byte{0x5a}, effectiveSOCKSPayload)
-	sendSOCKSDatagram(udpLocal, udpRelay, peerUDP.LocalAddr().String(), outboundUDP)
+	for _, association := range udpAssociations {
+		udpSource, receivedUDP := readSOCKSDatagram(association.local)
+		check(udpSource == peerUDP.LocalAddr().String() && bytes.Equal(receivedUDP, inboundUDP), "public UDP fanout mismatch")
+	}
+	afterInbound := pathWire(child, "gateway-path", 1)
+	checkMonotonic(beforeInbound, afterInbound)
+	check(afterInbound.RelayDownloadBytes-beforeInbound.RelayDownloadBytes == uint64(len(inboundUDP)*len(udpAssociations)) &&
+		afterInbound.RelayDownloadCopies-beforeInbound.RelayDownloadCopies == uint64(len(udpAssociations)), "UDP fanout counters mismatch")
+	check(afterInbound.CarrierDownloadBytes > beforeInbound.CarrierDownloadBytes &&
+		afterInbound.CarrierDownloadPackets > beforeInbound.CarrierDownloadPackets, "inbound carrier counters did not advance")
+	outboundPayloads := make([][]byte, len(udpAssociations))
+	start := make(chan struct{})
+	sendErrors := make(chan error, len(udpAssociations))
+	outboundBytes := 0
+	for index, association := range udpAssociations {
+		size := 1200 + index
+		if index == 0 {
+			size = effectiveSOCKSPayload
+		}
+		outboundPayloads[index] = bytes.Repeat([]byte{byte(0x50 + index)}, size)
+		outboundBytes += len(outboundPayloads[index])
+		go func(association udpFixtureAssociation, payload []byte) {
+			<-start
+			sendErrors <- writeSOCKSDatagram(association.local, association.relay, peerUDP.LocalAddr().String(), payload)
+		}(association, outboundPayloads[index])
+	}
+	close(start)
+	for range udpAssociations {
+		must(<-sendErrors)
+	}
 	peerUDP.SetReadDeadline(time.Now().Add(5 * time.Second))
 	udpBuffer := make([]byte, 65535)
-	udpSize, udpFrom, err := peerUDP.ReadFromUDP(udpBuffer)
-	must(err)
-	check(udpFrom.String() == publicUDP.String() && bytes.Equal(udpBuffer[:udpSize], outboundUDP), "public UDP return mismatch")
-	sendSOCKSDatagram(udpLocal, udpRelay, peerUDP.LocalAddr().String(), bytes.Repeat([]byte{0xff}, effectiveSOCKSPayload+1))
-	expectEOF(udpControl)
+	receivedOutbound := make(map[string]bool, len(outboundPayloads))
+	for range outboundPayloads {
+		udpSize, udpFrom, err := peerUDP.ReadFromUDP(udpBuffer)
+		must(err)
+		check(udpFrom.String() == publicUDP.String(), "public UDP source mismatch")
+		receivedOutbound[string(udpBuffer[:udpSize])] = true
+	}
+	for _, payload := range outboundPayloads {
+		check(receivedOutbound[string(payload)], "concurrent outbound UDP payload missing")
+	}
+	afterOutbound := pathWire(child, "gateway-path", 1)
+	checkMonotonic(afterInbound, afterOutbound)
+	check(afterOutbound.RelayUploadBytes-afterInbound.RelayUploadBytes == uint64(outboundBytes), "outbound relay counter mismatch")
+	check(afterOutbound.CarrierUploadBytes > afterInbound.CarrierUploadBytes &&
+		afterOutbound.CarrierUploadPackets > afterInbound.CarrierUploadPackets, "outbound carrier counters did not advance")
+	sendSOCKSDatagram(udpAssociations[0].local, udpAssociations[0].relay, peerUDP.LocalAddr().String(), bytes.Repeat([]byte{0xff}, effectiveSOCKSPayload+1))
+	expectEOF(udpAssociations[0].control)
 	peerUDP.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	_, _, err = peerUDP.ReadFromUDP(udpBuffer)
 	check(err != nil, "oversized SOCKS payload reached public UDP endpoint")
+	udpAssociations[0].local.Close()
+	udpAssociations[0].control, udpAssociations[0].local, udpAssociations[0].relay = openAuthenticatedUDP(pathEndpoint)
+	defer udpAssociations[0].control.Close()
+	defer udpAssociations[0].local.Close()
+	sendSOCKSDatagram(udpAssociations[0].local, udpAssociations[0].relay, "127.0.0.1:9", []byte("replacement-prime"))
+	beforeTCP := pathWire(child, "gateway-path", 1)
 	peer, err := net.DialTimeout("tcp", endpoint.PublicEndpoint, 2*time.Second)
 	must(err)
 	defer peer.Close()
@@ -789,19 +925,29 @@ func run() (evidence map[string]any) {
 	payload := bytes.Repeat([]byte("gateway-client-through-selected-path\x00"), 4096)
 	_, err = peer.Write(payload)
 	must(err)
+	must(peer.(*net.TCPConn).CloseWrite())
 	relay.SetReadDeadline(time.Now().Add(4 * time.Second))
 	received := make([]byte, len(payload))
 	_, err = io.ReadFull(relay, received)
 	must(err)
 	check(bytes.Equal(received, payload), "inbound payload mismatch")
+	expectEOF(relay)
 	replyPayload := bytes.Repeat([]byte("return-stream\x00"), 2048)
 	_, err = relay.Write(replyPayload)
 	must(err)
+	must(relay.(*net.TCPConn).CloseWrite())
 	peer.SetReadDeadline(time.Now().Add(4 * time.Second))
 	replied := make([]byte, len(replyPayload))
 	_, err = io.ReadFull(peer, replied)
 	must(err)
 	check(bytes.Equal(replied, replyPayload), "return payload mismatch")
+	expectEOF(peer)
+	afterTCP := pathWire(child, "gateway-path", 1)
+	checkMonotonic(beforeTCP, afterTCP)
+	check(afterTCP.RelayDownloadBytes-beforeTCP.RelayDownloadBytes == uint64(len(payload)) &&
+		afterTCP.RelayUploadBytes-beforeTCP.RelayUploadBytes == uint64(len(replyPayload)), "TCP relay counters mismatch")
+	check(afterTCP.CarrierDownloadBytes > beforeTCP.CarrierDownloadBytes && afterTCP.CarrierUploadBytes > beforeTCP.CarrierUploadBytes,
+		"TCP carrier counters did not advance")
 	reused, err := net.DialTimeout("tcp", net.JoinHostPort(endpoint.RelayHost, strconv.Itoa(endpoint.RelayPort)), time.Second)
 	must(err)
 	_, err = reused.Write(append([]byte("QBIN\x01"), token...))
@@ -815,13 +961,16 @@ func run() (evidence map[string]any) {
 	check(proxy.countTCP(dnsAddress) >= 1 && proxy.countTCP(ready.Control) >= 2 && proxy.countUDP(ready.Datagrams) > 0,
 		"gateway DNS/control/work/datagrams bypassed selected proxy fixture")
 	evidence["tcpVerifiedBytes"] = len(payload) + len(replyPayload)
-	evidence["udpVerifiedBytes"] = len(inboundUDP) + len(outboundUDP)
+	evidence["udpVerifiedBytes"] = len(inboundUDP) + outboundBytes
 	evidence["selectedProxyGatewayDials"] = proxy.countTCP(ready.Control)
 	evidence["selectedProxyGatewayDatagrams"] = proxy.countUDP(ready.Datagrams)
 	evidence["selectedProxyDNSDials"] = proxy.countTCP(dnsAddress)
 	evidence["stableAuthenticatedRelay"] = true
 	closed := child.request("gateway.close", map[string]any{"pathId": "gateway-path", "generation": 1})
 	check(closed.Error == nil && closed.FieldCount == 3 && string(closed.Result) == "{}", "gateway close result mismatch")
+	for _, association := range udpAssociations {
+		expectEOF(association.control)
+	}
 	expectEOF(peer)
 	_, err = net.DialTimeout("tcp", net.JoinHostPort(endpoint.RelayHost, strconv.Itoa(endpoint.RelayPort)), 300*time.Millisecond)
 	check(err != nil, "relay listener survived close")
@@ -829,8 +978,10 @@ func run() (evidence map[string]any) {
 		"same-generation gateway replacement admitted")
 
 	check(child.request("close", map[string]any{"pathId": "gateway-path", "generation": 1}).Error == nil, "first path close failed")
+	check(len(decodeStatus(child.request("status", nil))) == 0, "closed path remained in status")
 	pathFields["generation"] = 2
 	secondPath := decodePathEndpoint(child.request("open", pathFields))
+	check(pathWire(child, "gateway-path", 2) == (wireSnapshot{}), "next generation inherited counters")
 	tcpOnlyGateway := make(map[string]any)
 	for key, value := range baseGateway {
 		tcpOnlyGateway[key] = value
@@ -897,10 +1048,14 @@ func run() (evidence map[string]any) {
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	failurePath := decodePathEndpoint(failureChild.request("open", failurePathFields))
 	decodeEndpoint(failureChild.request("gateway.open", map[string]any{"pathId": "failure-path", "generation": 1, "gateway": baseGateway}))
-	failureControl, failureLocal, failureRelay := openAuthenticatedUDP(failurePath)
-	defer failureControl.Close()
-	defer failureLocal.Close()
-	sendSOCKSDatagram(failureLocal, failureRelay, "127.0.0.1:9", []byte("failure-association-prime"))
+	failureAssociations := make([]udpFixtureAssociation, 4)
+	for index := range failureAssociations {
+		failureAssociations[index].control, failureAssociations[index].local, failureAssociations[index].relay = openAuthenticatedUDP(failurePath)
+		defer failureAssociations[index].control.Close()
+		defer failureAssociations[index].local.Close()
+		sendSOCKSDatagram(failureAssociations[index].local, failureAssociations[index].relay, "127.0.0.1:9", []byte(fmt.Sprintf("failure-association-prime-%d", index)))
+	}
+	expectUDPAssociateRejected(failurePath)
 	fallbackPeer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	must(err)
 	defer fallbackPeer.Close()
@@ -916,8 +1071,10 @@ func run() (evidence map[string]any) {
 		gatewayStopped = true
 		panic("gateway carrier shutdown timeout")
 	}
-	expectEOF(failureControl)
-	_ = writeSOCKSDatagram(failureLocal, failureRelay, fallbackPeer.LocalAddr().String(), []byte("must-not-fall-open"))
+	for _, association := range failureAssociations {
+		expectEOF(association.control)
+		_ = writeSOCKSDatagram(association.local, association.relay, fallbackPeer.LocalAddr().String(), []byte("must-not-fall-open"))
+	}
 	time.Sleep(200 * time.Millisecond)
 	check(proxy.countUDP(fallbackPeer.LocalAddr().String()) == 0, "gateway failure switched UDP association to direct egress")
 	expectUDPAssociateRejected(failurePath)
@@ -932,6 +1089,8 @@ func run() (evidence map[string]any) {
 	must(failureChild.command.Wait())
 	check(gatewayErrors.Len() == 0, "gateway emitted stderr")
 	evidence["udpAssociationsFailClosed"] = true
+	evidence["udpMultiplexBounded"] = true
+	evidence["wireCounters"] = true
 	evidence["loopbackPublicEndpointProven"] = true
 	evidence["status"] = "passed"
 	return evidence

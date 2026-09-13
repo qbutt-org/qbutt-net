@@ -19,4 +19,6 @@ assert.equal(evidence.publicInboundProven, false);
 assert.equal(evidence.loopbackPublicEndpointProven, true);
 assert.equal(evidence.parentEOFCleanup, true);
 assert.equal(evidence.udpAssociationsFailClosed, true);
+assert.equal(evidence.udpMultiplexBounded, true);
+assert.equal(evidence.wireCounters, true);
 console.log(JSON.stringify({ evidence: join(root, "evidence.json"), ...evidence }));

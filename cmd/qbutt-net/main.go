@@ -8,6 +8,7 @@ import (
 	"io"
 	stdlog "log"
 	"os"
+	"sort"
 	"sync"
 
 	mierulog "github.com/enfein/mieru/v3/pkg/log"
@@ -134,6 +135,18 @@ func run() error {
 				entries = append(entries, map[string]string{"name": proxy["name"].(string), "type": proxy["type"].(string)})
 			}
 			reply.Result = map[string]any{"proxies": entries}
+		case req.Method == "status":
+			ids := make([]string, 0, len(paths))
+			for id := range paths {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			entries := make([]pathStatus, 0, len(ids))
+			for _, id := range ids {
+				p := paths[id]
+				entries = append(entries, pathStatus{PathID: id, Generation: p.generation, Wire: p.wire.snapshot()})
+			}
+			reply.Result = map[string]any{"paths": entries}
 		case req.Method == "open":
 			if !validLabel(req.PathID) || req.Generation == 0 || req.Generation > 9007199254740991 {
 				reply.Error = failure("invalid_path")

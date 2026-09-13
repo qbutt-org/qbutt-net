@@ -163,6 +163,7 @@ try {
   assert.equal((await child.request("list", { configPath })).error.code, "hello_required");
   assert.equal((await child.request("hello", { v: 1 })).error.code, "protocol_mismatch");
   assert.equal((await child.request("hello")).result.upstreamRevision, "d3ec342d441b086ec4318332f59dd05d8a2b5697");
+  assert.deepEqual((await child.request("status")).result, { paths: [] });
   assert.equal((await child.request("list", { configPath })).result.proxies.length, 3);
   const boundedConfig = join(temporary, "bounds.yaml");
   await writeFile(boundedConfig, JSON.stringify({ proxies: Array.from({length: 326}, (_, index) => ({name: `node-${index}`, type: "socks5"})) }));
@@ -191,6 +192,9 @@ try {
   assert.equal(endpoint.host, "127.0.0.1");
   assert.equal(endpoint.capabilities.udp, "source-supported");
   assert.equal(endpoint.capabilities.publicUdp, "unknown");
+  const zeroWire = { relayDownloadBytes: 0, relayUploadBytes: 0, carrierDownloadBytes: 0, carrierUploadBytes: 0,
+    carrierDownloadPackets: 0, carrierUploadPackets: 0, relayDownloadCopies: 0 };
+  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 1, wire: zeroWire }] });
   assert.equal((await child.request("open", parameters)).error.code, "path_exists");
   const noAuth = await connect(endpoint);
   noAuth.socket.write(Buffer.from([5, 1, 0]));
@@ -222,8 +226,13 @@ try {
     udpClient.send(packet, relayPort, "127.0.0.1");
     assert.deepEqual(await received, packet);
   } finally { udpClient.close(); }
+  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 1, wire: {
+    ...zeroWire, relayDownloadBytes: payload.length * 2 + 1024, relayUploadBytes: payload.length * 2 + 1024,
+    relayDownloadCopies: 1,
+  } }] });
   assert.equal((await child.request("close", { pathId: "fixture", generation: 2 })).error.code, "generation_mismatch");
   assert.deepEqual((await child.request("close", { pathId: "fixture", generation: 1 })).result, {});
+  assert.deepEqual((await child.request("status")).result, { paths: [] });
   await closed(tcp.socket);
   await closed(association.socket);
   const endpoint2 = (await child.request("open", { ...parameters, generation: 2 })).result;
@@ -231,6 +240,9 @@ try {
   const pending = await openTCP(endpoint2);
   pending.socket.write(payload);
   assert.deepEqual(await pending.read(payload.length), payload);
+  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 2, wire: {
+    ...zeroWire, relayDownloadBytes: payload.length, relayUploadBytes: payload.length,
+  } }] });
   child.child.stdin.end();
   assert.equal(await deadline(child.exited, "EOF shutdown"), 0);
   await closed(pending.socket);
@@ -249,7 +261,7 @@ try {
   assert.equal(tcpPayloadBytes, payload.length * 3);
   assert.equal(udpPayloadBytes, 1024);
   assert.deepEqual(upstreamErrors, []);
-  console.log(JSON.stringify({ passed: true, tcpPayloadBytes, udpPayloadBytes, checks: ["version handshake", "selected YAML import", "326-node subscription", "config/proxy/response bounds", "external credential rejection", "auxiliary DNS and unbound transport rejection", "chain alias rejection", "interface validation", "required authentication", "TCP payload", "TCP half-close", "UDP payload", "generation guard", "accepted socket close", "EOF cleanup", "shutdown", "bounded invalid frames"] }));
+  console.log(JSON.stringify({ passed: true, tcpPayloadBytes, udpPayloadBytes, checks: ["version handshake", "selected YAML import", "326-node subscription", "config/proxy/response bounds", "external credential rejection", "auxiliary DNS and unbound transport rejection", "chain alias rejection", "interface validation", "required authentication", "TCP payload", "TCP half-close", "UDP payload", "path-generation wire counters", "generation guard", "accepted socket close", "EOF cleanup", "shutdown", "bounded invalid frames"] }));
 } finally {
   for (const child of children) if (child.child.exitCode === null) child.child.kill();
   for (const socket of sockets) socket.destroy();
