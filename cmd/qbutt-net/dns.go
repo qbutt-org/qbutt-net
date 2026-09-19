@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"slices"
@@ -66,6 +67,53 @@ func dnsName(host string) (string, error) {
 		return "", errDNS
 	}
 	return name, nil
+}
+
+func boundResolver(owner *path, server netip.AddrPort, family, interfaceName string) *pathResolver {
+	physical := dialer.NewDialer(dialer.WithInterface(interfaceName), dialer.WithResolver(&pathResolver{}), dialer.WithFallbackBind(false))
+	return &pathResolver{owner: owner, server: server, family: family,
+		dial: func(ctx context.Context, address string) (net.Conn, error) {
+			network := "tcp4"
+			if server.Addr().Is6() {
+				network = "tcp6"
+			}
+			return physical.DialContext(ctx, network, address)
+		}}
+}
+
+func resolveNative(req request) ([]netip.Addr, *controlError) {
+	if !validLabel(req.PathID) || req.Generation == 0 || req.Generation > 9007199254740991 {
+		return nil, failure("invalid_path")
+	}
+	if !validLabel(req.InterfaceName) {
+		return nil, failure("interface_required")
+	}
+	iface, err := net.InterfaceByName(req.InterfaceName)
+	if err != nil || iface.Flags&net.FlagUp == 0 {
+		return nil, failure("interface_unavailable")
+	}
+	if req.DNS == nil {
+		return nil, failure("dns_policy_required")
+	}
+	server, err := dnsServer(req.DNS.Server)
+	_, bootstrapErr := dnsServer(req.DNS.BootstrapServer)
+	if err != nil || bootstrapErr != nil || !validFamily(req.DNS.Family) {
+		return nil, failure("invalid_dns_policy")
+	}
+	if !validFamily(req.Family) {
+		return nil, failure("invalid_dns_family")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dnsTimeout)
+	defer cancel()
+	// Own only this query's tracked sockets. No proxy or payload listener exists,
+	// and no result/cache survives the request's parent-supplied generation.
+	owner := &path{ctx: ctx, connections: make(map[io.Closer]struct{})}
+	resolver := boundResolver(owner, server, req.DNS.Family, req.InterfaceName)
+	addresses, err := resolver.lookup(ctx, req.Host, req.Family)
+	if err != nil {
+		return nil, failure("path_dns_failed")
+	}
+	return addresses, nil
 }
 
 // Mihomo's Resolver.Invalid() means usable, despite its historical name.

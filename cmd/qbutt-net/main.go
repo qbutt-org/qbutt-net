@@ -132,6 +132,13 @@ func run() error {
 			}
 			paths[req.PathID] = p
 			reply.Result = p.endpoint(req)
+		case req.Method == "resolveNative":
+			addresses, err := resolveNative(req)
+			if err != nil {
+				reply.Error = err
+				break
+			}
+			reply.Result = map[string]any{"pathId": req.PathID, "generation": req.Generation, "addresses": addresses}
 		case req.Method == "resolve":
 			p, exists := paths[req.PathID]
 			if !exists {

@@ -73,15 +73,8 @@ func openPath(req request) (*path, *controlError) {
 			cancel()
 		}
 	}()
-	physical := dialer.NewDialer(dialer.WithInterface(req.InterfaceName), dialer.WithResolver(&pathResolver{}), dialer.WithFallbackBind(false))
-	bootstrap := &pathResolver{owner: p, server: bootstrapAddress, onlyHost: serverName, family: "dual",
-		dial: func(ctx context.Context, address string) (net.Conn, error) {
-			network := "tcp4"
-			if bootstrapAddress.Addr().Is6() {
-				network = "tcp6"
-			}
-			return physical.DialContext(ctx, network, address)
-		}}
+	bootstrap := boundResolver(p, bootstrapAddress, "dual", req.InterfaceName)
+	bootstrap.onlyHost = serverName
 	bound := serverDialer{Dialer: dialer.NewDialer(dialer.WithInterface(req.InterfaceName), dialer.WithResolver(bootstrap), dialer.WithFallbackBind(false)), bootstrap: bootstrap}
 	proxy, err := adapter.ParseProxy(mapping, adapter.WithDialerForAPI(bound))
 	if err != nil {

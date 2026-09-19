@@ -11,6 +11,9 @@ import { createServer as createTLSServer, type TLSSocket } from "node:tls";
 const binary = resolve(process.argv[2] ?? "../qbutt-build/qbutt-net-dns.exe");
 const interfaceName = Object.entries(networkInterfaces()).find(([, ips]) => ips?.some(ip => ip.internal && ip.family === "IPv4"))?.[0];
 assert(interfaceName, "Loopback fixture interface is required");
+const nativeInterface = process.argv[3] ?? interfaceName;
+const nativeAddress = networkInterfaces()[nativeInterface]?.find(ip => ip.family === "IPv4")?.address;
+assert(nativeAddress, "Native DNS fixture requires an IPv4 address on its selected interface");
 const temporary = await mkdtemp(join(tmpdir(), "qbutt-path-dns-"));
 const sockets = new Set<Socket>();
 const errors: string[] = [];
@@ -79,6 +82,14 @@ async function dnsReply(wire: Wire, path: string, lastByte: number) {
 const bootstrap = createServer(socket => { const wire = new Wire(socket); void dnsReply(wire, "bootstrap", 1).catch(error => errors.push(String(error))); });
 await new Promise<void>(resolve => bootstrap.listen(0, "127.0.0.1", resolve));
 const bootstrapAddress = `127.0.0.1:${(bootstrap.address() as any).port}`;
+const nativeSources: string[] = [];
+const nativeDNS = createServer(socket => {
+  nativeSources.push(socket.remoteAddress ?? "");
+  const wire = new Wire(socket);
+  void dnsReply(wire, "native", 4).catch(error => errors.push(String(error)));
+});
+await new Promise<void>(resolve => nativeDNS.listen(0, nativeAddress, resolve));
+const nativeDNSAddress = `${nativeAddress}:${(nativeDNS.address() as any).port}`;
 let rogueConnections = 0;
 const rogue = createServer(socket => { rogueConnections++; socket.destroy(); });
 await new Promise<void>(resolve => rogue.listen(0, "127.0.0.1", resolve));
@@ -148,6 +159,32 @@ try {
     proxies: [...upstreams.map(item => ({ name: item.name, type: "socks5", server: `edge-${item.name}.test`, port: item.port, udp: true, tls: true, "skip-cert-verify": true })),
       { name: "g", type: "gost-relay", server: "127.0.0.1", port: (blackhole.address() as any).port, udp: true }] }));
   assert.equal((await request("hello")).result.protocol, 2);
+  const native = { pathId: "native", generation: 1, interfaceName: nativeInterface,
+    dns: { server: nativeDNSAddress, bootstrapServer: nativeDNSAddress, family: "dual" },
+    host: "same.test", family: "dual" };
+  for (const generation of [1, 2]) {
+    assert.deepEqual((await request("resolveNative", { ...native, generation })).result,
+      { pathId: "native", generation, addresses: ["127.0.0.4", "::4"] });
+  }
+  assert.equal(queries.filter(query => query.path === "native" && query.host === "same.test").length, 4,
+    "Native requests must not share a generation's cache");
+  assert(nativeSources.length === 4 && nativeSources.every(address => address === nativeAddress),
+    "Native DNS did not use the selected local interface address");
+  assert.equal((await request("close", { pathId: "native", generation: 2 })).error.code, "path_not_found",
+    "Native DNS must not create a payload path");
+  assert.equal((await request("resolveNative", { ...native, generation: 0 })).error.code, "invalid_path");
+  assert.equal((await request("resolveNative", { ...native, interfaceName: "missing-qbutt-interface" })).error.code, "interface_unavailable");
+  assert.equal((await request("resolveNative", { ...native, dns: undefined })).error.code, "dns_policy_required");
+  assert.equal((await request("resolveNative", { ...native, dns: { ...native.dns, server: "localhost:53" } })).error.code, "invalid_dns_policy");
+  assert.equal((await request("resolveNative", { ...native, dns: { ...native.dns, bootstrapServer: "localhost:53" } })).error.code, "invalid_dns_policy");
+  assert.equal((await request("resolveNative", { ...native, family: "invalid" })).error.code, "invalid_dns_family");
+  for (const host of ["missing.test", "wrong-id.test", "truncated.test"])
+    assert.equal((await request("resolveNative", { ...native, host })).error.code, "path_dns_failed");
+  assert.deepEqual((await request("resolveNative", { ...native, host: "localhost", family: "ipv4" })).result.addresses,
+    ["127.0.0.4"], "Native lookup escaped to the system hosts resolver");
+  const nativeTimeoutStart = Date.now();
+  assert.equal((await request("resolveNative", { ...native, host: "slow.test" })).error.code, "path_dns_failed");
+  assert(Date.now() - nativeTimeoutStart < 6000, "Native DNS escaped its timeout");
   const params = (id: string, generation = 1, family = "dual") => ({ configPath, proxyName: id.startsWith("a") ? "a" : id, pathId: id, generation, interfaceName,
     dns: { server: dnsAddress, bootstrapServer: bootstrapAddress, family } });
   assert.equal((await request("open", { ...params("a"), dns: undefined })).error.code, "dns_policy_required");
@@ -238,11 +275,13 @@ try {
   assert.equal(await deadline(exited, "EOF during DNS"), 0); assert(Date.now() - start < 6000, "Serial resolve blocked EOF beyond DNS bound");
   assert.equal(stderr, ""); assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, queries: queries.length, tcpVerifiedBytes, udpVerifiedBytes,
+    nativeDNS: { boundAddressVerified: true, nonLoopbackInterface: nativeInterface !== interfaceName,
+      ephemeralGeneration: true, noSystemFallback: true, validationAndTimeout: true },
     checks: ["explicit v2 DNS policy", "two-path independent A/AAAA", "TLS server hostname preserved", "numeric IPv4/IPv6 TCP and UDP destinations", "SOCKS unspecified UDP bind bootstrap", "UDP TTL cache, TTL zero and expiry", "bootstrap/destination CNAME and cycle rejection", "localhost resolved through path", "family and generation guards", "NXDOMAIN no fallback", "malformed/truncated/over-limit DNS rejected", "imported rogue DNS unused", "GOST handshake timeout and TCP/UDP close", "pending DNS cancelled by close", "generation cache isolation", "EOF bounded during resolver timeout"] }));
 } finally {
   if (child.exitCode === null) child.kill();
   for (const socket of sockets) socket.destroy();
-  bootstrap.close(); rogue.close(); blackhole.close();
+  bootstrap.close(); nativeDNS.close(); rogue.close(); blackhole.close();
   for (const upstream of upstreams) { upstream.server.close(); upstream.udp.close(); }
   await rm(temporary, { recursive: true, force: true });
 }

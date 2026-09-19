@@ -51,6 +51,7 @@ Requests use these fields at the top level:
 | `list` | `configPath` | `proxies: [{name,type}]` |
 | `open` | `configPath`, `proxyName`, `pathId`, `generation`, `interfaceName`, `dns` | Bound listener, private credentials and source capabilities |
 | `resolve` | `pathId`, `generation`, `host`, `family` | `addresses: [numeric IP]`, at most 64 |
+| `resolveNative` | `pathId`, `generation`, `interfaceName`, `dns`, `host`, `family` | `pathId`, `generation`, `addresses: [numeric IP]`, at most 64 |
 | `close` | `pathId`, `generation` | `{}` after tracked I/O stops |
 | `shutdown` | none | `{}`, then process exit |
 
@@ -89,6 +90,10 @@ Failures use fixed codes and no raw adapter/parser data:
 Codes include `protocol_mismatch`, `hello_required`, `invalid_request_id`, `unknown_method`, `absolute_config_path_required`, `config_unreadable`, `config_not_regular`, `config_limit`, `invalid_config`, `no_proxies`, `proxy_limit`, `invalid_proxy_identity`, `proxy_not_found`, `unsupported_proxy_type`, `proxy_chain_not_supported`, `external_credentials_not_supported`, `invalid_path`, `path_exists`, `path_not_found`, `path_limit`, `generation_mismatch`, `interface_required`, `interface_unavailable`, `adapter_rejected`, `listener_failed`, `credentials_failed` and `response_limit`.
 
 DNS-specific failures are `dns_policy_required`, `invalid_dns_policy`, `invalid_dns_family`, `path_dns_failed`, `auxiliary_dns_not_supported` and `unbound_transport_not_supported`. None includes the hostname, subscription URL or upstream error text.
+
+`resolveNative` is an additive protocol-2 request for parent-approved Native discovery. It validates an up interface and both numeric DNS endpoints, then queries `dns.server` over TCP bound to that interface with fallback binding disabled. It has no proxy hostname, so `bootstrapServer` is validated but unused. Each request owns an ephemeral resolver and its tracked sockets; it neither opens a payload listener nor shares a cache across requests. The response echoes path identity for the parent to reject stale generations. The parent must authorize the current mode, generation and physical interface before requesting Native resolution. The existing five-second DNS bound also bounds serial EOF/shutdown processing.
+
+The DNS integration fixture accepts an optional physical interface name after the binary. Its Native DNS server binds only to that interface's local IPv4 address and verifies the incoming source address, A/AAAA answers, request-generation isolation, rejected policy/interface inputs, no hosts-file fallback and timeout. Without the argument it uses loopback; neither variant proves public resolver reachability or bypass of a system TUN.
 
 ## Payload and lifecycle
 
