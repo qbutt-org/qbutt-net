@@ -8,6 +8,9 @@ import (
 	"io"
 	stdlog "log"
 	"os"
+	"sort"
+	"sync"
+	"sync/atomic"
 
 	mierulog "github.com/enfein/mieru/v3/pkg/log"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -15,23 +18,24 @@ import (
 )
 
 const (
-	protocolVersion  = 2
+	protocolVersion  = 4
 	maxFrameBytes    = 65536
 	upstreamRevision = "d3ec342d441b086ec4318332f59dd05d8a2b5697"
 )
 
 type request struct {
-	Version       int        `json:"v"`
-	ID            uint64     `json:"id"`
-	Method        string     `json:"method"`
-	ConfigPath    string     `json:"configPath"`
-	ProxyName     string     `json:"proxyName"`
-	PathID        string     `json:"pathId"`
-	Generation    uint64     `json:"generation"`
-	InterfaceName string     `json:"interfaceName"`
-	DNS           *dnsPolicy `json:"dns"`
-	Host          string     `json:"host"`
-	Family        string     `json:"family"`
+	Version       int             `json:"v"`
+	ID            uint64          `json:"id"`
+	Method        string          `json:"method"`
+	ConfigPath    string          `json:"configPath"`
+	ProxyName     string          `json:"proxyName"`
+	PathID        string          `json:"pathId"`
+	Generation    uint64          `json:"generation"`
+	InterfaceName string          `json:"interfaceName"`
+	DNS           *dnsPolicy      `json:"dns"`
+	Host          string          `json:"host"`
+	Family        string          `json:"family"`
+	Gateway       *gatewayOptions `json:"gateway"`
 }
 
 type response struct {
@@ -44,6 +48,25 @@ type response struct {
 type controlError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type controlWriter struct {
+	mu      sync.Mutex
+	closing atomic.Bool
+}
+
+func (writer *controlWriter) write(value any, id uint64) error {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if len(data)+1 > maxFrameBytes {
+		data, _ = json.Marshal(response{Version: protocolVersion, ID: id, Error: failure("response_limit")})
+	}
+	_, err = os.Stdout.Write(append(data, '\n'))
+	return err
 }
 
 // Only fixed diagnostics cross IPC. Adapter/parser errors may contain credentials.
@@ -77,7 +100,9 @@ func main() {
 
 func run() error {
 	paths := make(map[string]*path)
+	output := &controlWriter{}
 	defer func() {
+		output.closing.Store(true)
 		for _, p := range paths {
 			p.close()
 		}
@@ -91,6 +116,9 @@ func run() error {
 			return err
 		}
 		reply := response{Version: protocolVersion, ID: req.ID}
+		var publication *gatewayClient
+		publicationFailure := ""
+		publishesOpen := false
 		switch {
 		case req.Version != protocolVersion:
 			reply.Error = failure("protocol_mismatch")
@@ -112,6 +140,18 @@ func run() error {
 				entries = append(entries, map[string]string{"name": proxy["name"].(string), "type": proxy["type"].(string)})
 			}
 			reply.Result = map[string]any{"proxies": entries}
+		case req.Method == "status":
+			ids := make([]string, 0, len(paths))
+			for id := range paths {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			entries := make([]pathStatus, 0, len(ids))
+			for _, id := range ids {
+				p := paths[id]
+				entries = append(entries, pathStatus{PathID: id, Generation: p.generation, Wire: p.wire.snapshot()})
+			}
+			reply.Result = map[string]any{"paths": entries}
 		case req.Method == "open":
 			if !validLabel(req.PathID) || req.Generation == 0 || req.Generation > 9007199254740991 {
 				reply.Error = failure("invalid_path")
@@ -159,6 +199,79 @@ func run() error {
 				break
 			}
 			reply.Result = map[string]any{"addresses": addresses}
+		case req.Method == "gateway.open":
+			p, exists := paths[req.PathID]
+			if !exists {
+				reply.Error = failure("path_not_found")
+				break
+			}
+			if p.generation != req.Generation {
+				reply.Error = failure("generation_mismatch")
+				break
+			}
+			if p.gatewayOccupied() {
+				reply.Error = failure("gateway_exists")
+				break
+			}
+			gateway, err := openGateway(p, req.PathID, req.Generation, req.Gateway, output)
+			if err != nil {
+				reply.Error = err
+				break
+			}
+			if !p.installGateway(gateway) {
+				gateway.close()
+				reply.Error = failure("gateway_exists")
+				break
+			}
+			reply.Result = gateway.endpoint()
+			publication = gateway
+			publicationFailure = "gateway_lease_rejected"
+			publishesOpen = true
+		case req.Method == "gateway.renew":
+			p, exists := paths[req.PathID]
+			if !exists {
+				reply.Error = failure("path_not_found")
+				break
+			}
+			if p.generation != req.Generation {
+				reply.Error = failure("generation_mismatch")
+				break
+			}
+			gateway := p.currentGateway()
+			if gateway == nil {
+				reply.Error = failure("gateway_not_open")
+				break
+			}
+			result, err := gateway.renew()
+			if err != nil {
+				reply.Error = err
+				break
+			}
+			reply.Result = result
+			publication = gateway
+			publicationFailure = "gateway_renew_failed"
+		case req.Method == "gateway.close":
+			p, exists := paths[req.PathID]
+			if !exists {
+				reply.Error = failure("path_not_found")
+				break
+			}
+			if p.generation != req.Generation {
+				reply.Error = failure("generation_mismatch")
+				break
+			}
+			gateway := p.gatewayForClose()
+			if gateway == nil {
+				reply.Error = failure("gateway_not_open")
+				break
+			}
+			closeError := gateway.release()
+			gateway.close()
+			if closeError != nil {
+				reply.Error = closeError
+			} else {
+				reply.Result = struct{}{}
+			}
 		case req.Method == "close":
 			p, exists := paths[req.PathID]
 			if !exists {
@@ -173,6 +286,7 @@ func run() error {
 			delete(paths, req.PathID)
 			reply.Result = struct{}{}
 		case req.Method == "shutdown":
+			output.closing.Store(true)
 			for id, p := range paths {
 				p.close()
 				delete(paths, id)
@@ -181,15 +295,14 @@ func run() error {
 		default:
 			reply.Error = failure("unknown_method")
 		}
-		data, err := json.Marshal(reply)
-		if err != nil {
-			return err
+		var writeError error
+		if publication != nil {
+			writeError = publication.publishResponse(&reply, publicationFailure, publishesOpen)
+		} else {
+			writeError = output.write(reply, req.ID)
 		}
-		if len(data)+1 > maxFrameBytes {
-			data, _ = json.Marshal(response{Version: protocolVersion, ID: req.ID, Error: failure("response_limit")})
-		}
-		if _, err := os.Stdout.Write(append(data, '\n')); err != nil {
-			return err
+		if writeError != nil {
+			return writeError
 		}
 		if req.Method == "shutdown" && reply.Error == nil {
 			return nil
