@@ -29,6 +29,7 @@ type path struct {
 	resolver               *pathResolver
 	listener               net.Listener
 	generation             uint64
+	configuredServerID     string
 	username               string
 	password               string
 	ctx                    context.Context
@@ -129,6 +130,16 @@ func openPath(req request) (*path, *controlError) {
 	if importErr != nil {
 		return nil, importErr
 	}
+	identity := configuredServerID(mapping)
+	if identity == "" {
+		return nil, failure("invalid_configured_server")
+	}
+	if req.ConfiguredServerID == "" {
+		return nil, failure("configured_server_id_required")
+	}
+	if identity != req.ConfiguredServerID {
+		return nil, failure("server_identity_changed")
+	}
 	if req.DNS == nil {
 		return nil, failure("dns_policy_required")
 	}
@@ -150,7 +161,7 @@ func openPath(req request) (*path, *controlError) {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &path{generation: req.Generation, ctx: ctx, cancel: cancel, connections: make(map[io.Closer]struct{}),
+	p := &path{generation: req.Generation, configuredServerID: identity, ctx: ctx, cancel: cancel, connections: make(map[io.Closer]struct{}),
 		udpAssociations: make(map[*udpAssociation]struct{}), gatewayUDPAssociations: make(map[*udpAssociation]struct{})}
 	opened := false
 	defer func() {
@@ -200,13 +211,14 @@ func (p *path) endpoint(req request) map[string]any {
 		udp = "source-supported"
 	}
 	return map[string]any{
-		"pathId":        req.PathID,
-		"generation":    p.generation,
-		"interfaceName": req.InterfaceName,
-		"host":          "127.0.0.1",
-		"port":          p.listener.Addr().(*net.TCPAddr).Port,
-		"socksUsername": p.username,
-		"socksPassword": p.password,
+		"pathId":             req.PathID,
+		"generation":         p.generation,
+		"configuredServerId": p.configuredServerID,
+		"interfaceName":      req.InterfaceName,
+		"host":               "127.0.0.1",
+		"port":               p.listener.Addr().(*net.TCPAddr).Port,
+		"socksUsername":      p.username,
+		"socksPassword":      p.password,
 		"capabilities": map[string]string{
 			"tcp":         "supported",
 			"udp":         udp,

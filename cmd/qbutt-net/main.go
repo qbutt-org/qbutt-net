@@ -18,24 +18,25 @@ import (
 )
 
 const (
-	protocolVersion  = 4
+	protocolVersion  = 5
 	maxFrameBytes    = 65536
 	upstreamRevision = "d3ec342d441b086ec4318332f59dd05d8a2b5697"
 )
 
 type request struct {
-	Version       int             `json:"v"`
-	ID            uint64          `json:"id"`
-	Method        string          `json:"method"`
-	ConfigPath    string          `json:"configPath"`
-	ProxyName     string          `json:"proxyName"`
-	PathID        string          `json:"pathId"`
-	Generation    uint64          `json:"generation"`
-	InterfaceName string          `json:"interfaceName"`
-	DNS           *dnsPolicy      `json:"dns"`
-	Host          string          `json:"host"`
-	Family        string          `json:"family"`
-	Gateway       *gatewayOptions `json:"gateway"`
+	Version            int             `json:"v"`
+	ID                 uint64          `json:"id"`
+	Method             string          `json:"method"`
+	ConfigPath         string          `json:"configPath"`
+	ProxyName          string          `json:"proxyName"`
+	ConfiguredServerID string          `json:"configuredServerId"`
+	PathID             string          `json:"pathId"`
+	Generation         uint64          `json:"generation"`
+	InterfaceName      string          `json:"interfaceName"`
+	DNS                *dnsPolicy      `json:"dns"`
+	Host               string          `json:"host"`
+	Family             string          `json:"family"`
+	Gateway            *gatewayOptions `json:"gateway"`
 }
 
 type response struct {
@@ -137,9 +138,23 @@ func run() error {
 			}
 			entries := make([]map[string]string, 0, len(proxies))
 			for _, proxy := range proxies {
-				entries = append(entries, map[string]string{"name": proxy["name"].(string), "type": proxy["type"].(string)})
+				if req.ProxyName != "" && proxy["name"] != req.ProxyName {
+					continue
+				}
+				identity := configuredServerID(proxy)
+				if req.ProxyName != "" && identity == "" {
+					reply.Error = failure("invalid_configured_server")
+					break
+				}
+				entries = append(entries, map[string]string{"name": proxy["name"].(string), "type": proxy["type"].(string), "configuredServerId": identity})
 			}
-			reply.Result = map[string]any{"proxies": entries}
+			if reply.Error == nil {
+				if req.ProxyName != "" && len(entries) == 0 {
+					reply.Error = failure("proxy_not_found")
+				} else {
+					reply.Result = map[string]any{"proxies": entries}
+				}
+			}
 		case req.Method == "status":
 			ids := make([]string, 0, len(paths))
 			for id := range paths {

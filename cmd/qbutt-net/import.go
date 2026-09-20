@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/pem"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +19,30 @@ const maxConfigBytes = 2 * 1024 * 1024
 
 func validLabel(value string) bool {
 	return value != "" && len(value) <= 128 && strings.IndexFunc(value, unicode.IsControl) == -1
+}
+
+// Identity describes the configured server, not a probed egress. Different
+// names, protocols, ports and credentials on that server remain one edge.
+func configuredServerID(proxy map[string]any) string {
+	host, ok := proxy["server"].(string)
+	if !ok {
+		return ""
+	}
+	var canonical string
+	if address, err := netip.ParseAddr(host); err == nil {
+		if address.Zone() != "" || address.IsUnspecified() || address.IsMulticast() {
+			return ""
+		}
+		canonical = address.Unmap().String()
+	} else {
+		name, err := dnsName(host)
+		if err != nil {
+			return ""
+		}
+		canonical = strings.TrimSuffix(name, ".")
+	}
+	digest := sha256.Sum256([]byte("qbutt-configured-server-v1\x00" + canonical))
+	return hex.EncodeToString(digest[:])
 }
 
 // This parses data only. In particular it never calls Mihomo config.Parse,

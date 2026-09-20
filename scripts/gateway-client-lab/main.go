@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	parentProtocol        = 4
+	parentProtocol        = 5
 	effectiveSOCKSPayload = 65485
 )
 
@@ -803,11 +803,21 @@ func run() (evidence map[string]any) {
 		}
 		check(child.stderr.Len() == 0, "qbutt-net emitted stderr")
 	}()
-	check(errorCode(child.requestVersion(3, "hello", nil)) == "protocol_mismatch", "legacy v3 handshake admitted")
+	check(errorCode(child.requestVersion(4, "hello", nil)) == "protocol_mismatch", "legacy v4 handshake admitted")
 	evidence["legacyProtocolRejected"] = true
 	hello := child.request("hello", nil)
-	check(hello.Error == nil, "v4 hello failed")
-	pathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "gateway-path", "generation": 1,
+	check(hello.Error == nil, "v5 hello failed")
+	listed := child.request("list", map[string]any{"configPath": profilePath, "proxyName": "selected"})
+	check(listed.Error == nil, "selected list failed")
+	var identities struct {
+		Proxies []struct {
+			ConfiguredServerID string `json:"configuredServerId"`
+		} `json:"proxies"`
+	}
+	must(json.Unmarshal(listed.Result, &identities))
+	check(len(identities.Proxies) == 1 && len(identities.Proxies[0].ConfiguredServerID) == 64, "selected identity missing")
+	configuredServerID := identities.Proxies[0].ConfiguredServerID
+	pathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "gateway-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	pathEndpoint := decodePathEndpoint(child.request("open", pathFields))
 	check(pathWire(child, "gateway-path", 1) == (wireSnapshot{}), "new path counters were not zero")
@@ -1074,8 +1084,8 @@ func run() (evidence map[string]any) {
 	evidence["parentEOFCleanup"] = true
 
 	shutdownChild := startChild(os.Args[1])
-	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v4 hello failed")
-	shutdownPathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "shutdown-path", "generation": 1,
+	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v5 hello failed")
+	shutdownPathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "shutdown-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	decodePathEndpoint(shutdownChild.request("open", shutdownPathFields))
 	shutdownEndpoint := decodeEndpoint(shutdownChild.request("gateway.open", map[string]any{"pathId": "shutdown-path", "generation": 1, "gateway": baseGateway}))
@@ -1109,8 +1119,8 @@ func run() (evidence map[string]any) {
 		}
 		check(failureChild.stderr.Len() == 0, "failure qbutt-net emitted stderr")
 	}()
-	check(failureChild.request("hello", nil).Error == nil, "failure v4 hello failed")
-	failurePathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "pathId": "failure-path", "generation": 1,
+	check(failureChild.request("hello", nil).Error == nil, "failure v5 hello failed")
+	failurePathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "failure-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	failurePath := decodePathEndpoint(failureChild.request("open", failurePathFields))
 	failureGateway := decodeEndpoint(failureChild.request("gateway.open", map[string]any{"pathId": "failure-path", "generation": 1, "gateway": baseGateway}))

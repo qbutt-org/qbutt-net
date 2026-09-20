@@ -48,8 +48,8 @@ Launch `qbutt-net.exe --stdio` with private inherited stdin/stdout pipes, for ex
 Each UTF-8 JSON object ends with LF. Maximum frame size including LF is 65,536 bytes. Malformed JSON and oversized frames close every path and exit nonzero. Requests execute in order; `id` and `generation` are positive integers at most 2^53−1. Responses echo the request ID. `hello` must precede every other method. Version mismatch is explicit; no version fallback is attempted.
 
 ```json
-{"v":4,"id":1,"method":"hello"}
-{"v":4,"id":1,"result":{"protocol":4,"name":"qbutt-net","upstreamRevision":"d3ec342d441b086ec4318332f59dd05d8a2b5697","maxFrameBytes":65536}}
+{"v":5,"id":1,"method":"hello"}
+{"v":5,"id":1,"result":{"protocol":5,"name":"qbutt-net","upstreamRevision":"d3ec342d441b086ec4318332f59dd05d8a2b5697","maxFrameBytes":65536}}
 ```
 
 Requests use these fields at the top level:
@@ -57,9 +57,9 @@ Requests use these fields at the top level:
 | Method | Additional fields | Result |
 |---|---|---|
 | `hello` | none | Protocol/build base and frame limit |
-| `list` | `configPath` | `proxies: [{name,type}]` |
+| `list` | `configPath`, optional `proxyName` | `proxies: [{name,type,configuredServerId}]` |
 | `status` | none | Active `paths: [{pathId,generation,wire}]`, ordered by path ID |
-| `open` | `configPath`, `proxyName`, `pathId`, `generation`, `interfaceName`, `dns` | Bound listener, private credentials and source capabilities |
+| `open` | `configPath`, `proxyName`, `configuredServerId`, `pathId`, `generation`, `interfaceName`, `dns` | Bound listener, private credentials and source capabilities |
 | `resolve` | `pathId`, `generation`, `host`, `family` | `addresses: [numeric IP]`, at most 64 |
 | `resolveNative` | `pathId`, `generation`, `interfaceName`, `dns`, `host`, `family` | `pathId`, `generation`, `addresses: [numeric IP]`, at most 64 |
 | `gateway.open` | `pathId`, `generation`, `gateway` | Verified lease and stable local relay endpoint |
@@ -70,11 +70,15 @@ Requests use these fields at the top level:
 
 `configPath` is an absolute local regular YAML/JSON file, capped at 2 MiB. UNC/device paths are rejected. The parent downloads any subscription into its own private cache; this process imports only its `proxies` sequence, capped at 1,024 entries. Names must be unique, nonempty, free from control characters and at most 128 UTF-8 bytes. `list` returns explicit `response_limit` if its complete response would exceed the frame limit; it never silently truncates the subscription.
 
+`list` with `proxyName` returns exactly that entry or `proxy_not_found`. `configuredServerId` is the lowercase 64-hex SHA-256 of UTF-8 `qbutt-configured-server-v1` + one NUL byte + the canonical configured server: numeric IPs use Go `netip.Addr.Unmap().String()`, DNS names use IDNA Lookup ASCII, lowercase and no final dot. No DNS query or egress probe is performed; names, ports, protocols and credentials do not participate. Distinct configured DNS aliases can still name the same physical server, so differing IDs do not establish independent egress. Missing/invalid server entries stay visible with an empty ID in the full list; selected listing rejects them with `invalid_configured_server`.
+
+`open` requires the previously selected ID (`configured_server_id_required` if absent). It re-reads the selected entry and compares identity before constructing an adapter or listener; a different ID returns `server_identity_changed`. The successful endpoint echoes the verified ID. An `edgeId` supplied by the parent cannot override this comparison. Protocol 5 deliberately rejects older parents because both the list shape and required open input changed.
+
 `proxyName` selects exactly one concrete adapter. Direct bypass, routing groups, recursive dialer dependencies and system adapters are rejected. Case/underscore aliases cannot bypass routing-field checks. All other transport parameters are retained. File-backed `certificate`/`private-key` fields are rejected recursively; inline PEM credentials remain available. MASQUE's scalar private key is an inline protocol parameter.
 
 The parent supplies the physical interface by the Go/Windows friendly interface name, such as the Qt `humanReadableName()`. It must exist and be up at open time. The supplied value replaces every imported interface override; imported routing marks are discarded. Adapter connection errors remain errors, without a direct fallback.
 
-Protocol 4 requires an explicit parent-owned DNS policy on every open, path status counters, optional gateway methods and serialized events; older protocols are rejected. A basic configurable public-resolver default can be supplied by the desktop client:
+Protocol 5 requires a verified configured-server identity and an explicit parent-owned DNS policy on every open, path status counters, optional gateway methods and serialized events; older protocols are rejected. A basic configurable public-resolver default can be supplied by the desktop client:
 
 ```json
 {"dns":{"server":"1.1.1.1:53","bootstrapServer":"1.1.1.1:53","family":"dual"}}
@@ -89,7 +93,7 @@ Dynamic ECH discovery, Hysteria2 realm discovery and TLSMirror auxiliary traffic
 An `open` result has this shape (credentials below are illustrative):
 
 ```json
-{"v":4,"id":3,"result":{"pathId":"path-1","generation":1,"interfaceName":"Ethernet","host":"127.0.0.1","port":50000,"socksUsername":"example","socksPassword":"example","capabilities":{"tcp":"supported","udp":"source-supported","dns":"path-tcp","publicTcp":"unknown","publicUdp":"unknown","measurement":"not-probed"}}}
+{"v":5,"id":3,"result":{"pathId":"path-1","generation":1,"interfaceName":"Ethernet","configuredServerId":"dff36db9a061dbd4772e86dbe690c4899bdbea31ef5165e517d183f3ac3cb438","host":"127.0.0.1","port":50000,"socksUsername":"example","socksPassword":"example","capabilities":{"tcp":"supported","udp":"source-supported","dns":"path-tcp","publicTcp":"unknown","publicUdp":"unknown","measurement":"not-probed"}}}
 ```
 
 UDP is `source-supported` or `source-unsupported` according to the adapter's `SupportUDP()`. TCP availability describes the source adapter API. DNS `path-tcp` describes the configured resolver ownership and transport. These fields do not mean a successful connection or verified egress. No health state, public port, latency or loss is invented. The parent detects child process failure; `gatewayClosed` reports only terminal retirement of an installed gateway.
@@ -99,14 +103,14 @@ UDP is `source-supported` or `source-unsupported` according to the adapter's `Su
 Failures use fixed codes and no raw adapter/parser data:
 
 ```json
-{"v":4,"id":4,"error":{"code":"generation_mismatch","message":"generation_mismatch"}}
+{"v":5,"id":4,"error":{"code":"generation_mismatch","message":"generation_mismatch"}}
 ```
 
 Codes include `protocol_mismatch`, `hello_required`, `invalid_request_id`, `unknown_method`, `absolute_config_path_required`, `config_unreadable`, `config_not_regular`, `config_limit`, `invalid_config`, `no_proxies`, `proxy_limit`, `invalid_proxy_identity`, `proxy_not_found`, `unsupported_proxy_type`, `proxy_chain_not_supported`, `external_credentials_not_supported`, `invalid_path`, `path_exists`, `path_not_found`, `path_limit`, `generation_mismatch`, `interface_required`, `interface_unavailable`, `adapter_rejected`, `listener_failed`, `credentials_failed` and `response_limit`.
 
 DNS-specific failures are `dns_policy_required`, `invalid_dns_policy`, `invalid_dns_family`, `path_dns_failed`, `auxiliary_dns_not_supported` and `unbound_transport_not_supported`. None includes the hostname, subscription URL or upstream error text.
 
-`resolveNative` is a protocol-4 request for parent-approved Native discovery. It validates an up interface and both numeric DNS endpoints, then queries `dns.server` over TCP bound to that interface with fallback binding disabled. It has no proxy hostname, so `bootstrapServer` is validated but unused. Each request owns an ephemeral resolver and its tracked sockets; it neither opens a payload listener nor shares a cache across requests. The response echoes path identity for the parent to reject stale generations. The parent must authorize the current mode, generation and physical interface before requesting Native resolution. The existing five-second DNS bound also bounds serial EOF/shutdown processing.
+`resolveNative` is a protocol-5 request for parent-approved Native discovery. It validates an up interface and both numeric DNS endpoints, then queries `dns.server` over TCP bound to that interface with fallback binding disabled. It has no proxy hostname, so `bootstrapServer` is validated but unused. Each request owns an ephemeral resolver and its tracked sockets; it neither opens a payload listener nor shares a cache across requests. The response echoes path identity for the parent to reject stale generations. The parent must authorize the current mode, generation and physical interface before requesting Native resolution. The existing five-second DNS bound also bounds serial EOF/shutdown processing.
 
 The DNS integration fixture accepts an optional physical interface name after the binary. Its Native DNS server binds only to that interface's local IPv4 address and verifies the incoming source address, A/AAAA answers, request-generation isolation, rejected policy/interface inputs, no hosts-file fallback and timeout. Without the argument it uses loopback; neither variant proves public resolver reachability or bypass of a system TUN.
 
@@ -132,9 +136,9 @@ qbutt-net accepts `gateway.open` only for an existing exact path generation. Its
 
 Successful open and renew responses contain exactly `pathId`, `generation`, `publicEndpoint`, `tcp`, `udp`, `expiresUnixMilli`, `relayHost` and `relayPort`. Renewal must preserve the gateway lease, public endpoint, transport flags and one stable loopback relay. A replacement requires a later path generation. Closing the gateway retires the public lease, all work connections, pending tickets, QUIC and the relay; closing the path or parent pipe also performs that cleanup.
 
-Unexpected control, carrier or lease retirement of a published gateway emits exactly one serialized terminal event after internal retirement: `{"v":4,"id":0,"event":"gatewayClosed","pathId":"path-1","generation":1,"reason":"gateway_closed"}`. These are its only six fields, and `gateway_closed` is the only reason value. No `incomingTcp` or successful `gateway.open` or `gateway.renew` response for that generation follows the terminal event. An explicit parent `gateway.close`, path `close`, `shutdown` or parent-pipe EOF emits no such event; shutdown and EOF suppress events for every path before cleanup begins. The parent retires descriptors only when both path ID and generation match its active state; stale or duplicate events have no effect.
+Unexpected control, carrier or lease retirement of a published gateway emits exactly one serialized terminal event after internal retirement: `{"v":5,"id":0,"event":"gatewayClosed","pathId":"path-1","generation":1,"reason":"gateway_closed"}`. These are its only six fields, and `gateway_closed` is the only reason value. No `incomingTcp` or successful `gateway.open` or `gateway.renew` response for that generation follows the terminal event. An explicit parent `gateway.close`, path `close`, `shutdown` or parent-pipe EOF emits no such event; shutdown and EOF suppress events for every path before cleanup begins. The parent retires descriptors only when both path ID and generation match its active state; stale or duplicate events have no effect.
 
-Each accepted public TCP peer uses one authenticated work connection. Once work authentication succeeds, qbutt-net writes one serialized parent event with `v:4`, `id:0`, `event:"incomingTcp"`, the exact `pathId`, `generation`, numeric `remote`, `publicEndpoint`, `relayHost:"127.0.0.1"`, `relayPort` and a 64-character lowercase `relayToken`. The parent has five seconds to connect to the relay and write 37 bytes: ASCII `QBIN`, byte `1`, then the 32 raw token bytes. Tickets are single-use; at most 64 wait and at most 32 relay handshakes run concurrently.
+Each accepted public TCP peer uses one authenticated work connection. Once work authentication succeeds, qbutt-net writes one serialized parent event with `v:5`, `id:0`, `event:"incomingTcp"`, the exact `pathId`, `generation`, numeric `remote`, `publicEndpoint`, `relayHost:"127.0.0.1"`, `relayPort` and a 64-character lowercase `relayToken`. The parent has five seconds to connect to the relay and write 37 bytes: ASCII `QBIN`, byte `1`, then the 32 raw token bytes. Tickets are single-use; at most 64 wait and at most 32 relay handshakes run concurrently.
 
 For UDP, one path generation owns one public gateway carrier shared by at most four authenticated local SOCKS UDP associations. Outbound payloads from every association use that carrier. Each valid public reply is returned to every active association as an ordinary SOCKS UDP response with the original source endpoint; the application layer owns any protocol demultiplexing. A fifth simultaneous association is rejected. The effective payload limit at this SOCKS boundary is 65,485 bytes, leaving room for the largest numeric IPv6 source envelope inside one legal UDP datagram. An oversized local payload retires only its sending association; an oversized public reply retires every association because none can encode it at this boundary. The gateway carrier itself retains its 65,507-byte transport limit. Starting a UDP gateway retires existing direct UDP associations. Gateway expiry or carrier failure retires all its associations and rejects replacements until the parent advances the path generation, so a lease failure cannot change routes in place. A TCP-only gateway leaves ordinary adapter UDP unchanged. Reflection, rate, replay and reassembly policy stays owned by qbutt-gateway.
 
