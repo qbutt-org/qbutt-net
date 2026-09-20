@@ -474,9 +474,33 @@ func run() (evidence map[string]any) {
 	must(err)
 	defer unseen.Close()
 	packet.Remote = unseen.LocalAddr().(*net.UDPAddr).AddrPort()
-	packet.Payload = []byte("forged reflection")
+	packet.Payload = []byte("authenticated first contact")
 	send(udp, packet, 302, false, -1)
-	expectNoUDP(unseen)
+	unseen.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, source, err = unseen.ReadFromUDPAddrPort(buffer)
+	must(err)
+	check(source == endpoint && bytes.Equal(buffer[:n], packet.Payload), "authenticated first-contact UDP did not use the leased public endpoint")
+	_, err = unseen.WriteToUDPAddrPort([]byte("first-contact reply"), endpoint)
+	must(err)
+	replyPacket := receive(udp)
+	check(replyPacket.Lease == lease.Lease && replyPacket.Generation == 1 &&
+		replyPacket.Remote == packet.Remote && bytes.Equal(replyPacket.Payload, []byte("first-contact reply")),
+		"first-contact destination did not admit its exact reply")
+	wrongFamily := packet
+	wrongFamily.Remote = netip.MustParseAddrPort("[::1]:12345")
+	wrongFamily.Payload = []byte("wrong family")
+	policyBefore := control.request(gateway.Request{Method: "stats"})
+	check(policyBefore.Error == "" && policyBefore.Datagrams != nil, "policy diagnostics unavailable")
+	send(udp, wrongFamily, 303, false, -1)
+	privateRemote := packet
+	privateRemote.Remote = netip.MustParseAddrPort("10.255.255.254:9")
+	privateRemote.Payload = []byte("private destination denied")
+	send(udp, privateRemote, 304, false, -1)
+	expectNoUDP(publicUDP)
+	policyAfter := control.request(gateway.Request{Method: "stats"})
+	check(policyAfter.Error == "" && policyAfter.Datagrams != nil &&
+		policyAfter.Datagrams.PolicyDrops >= policyBefore.Datagrams.PolicyDrops+2,
+		"wrong-family or private destination was not rejected")
 
 	time.Sleep(time.Second)
 	byteRatePackets := 8
@@ -519,9 +543,47 @@ func run() (evidence map[string]any) {
 	evidence["datagramStats"] = stats
 	evidence["byteRateDeliveredPackets"] = deliveredByteRate
 	evidence["rateDeliveredPackets"] = receivedRatePackets
-	evidence["trueDatagramsOriginalEndpointAndNoReflection"] = true
+	evidence["trueDatagramsOriginalEndpointAndAuthenticatedFirstContact"] = true
 	replacement := control.acquire("one", 2, true, 20)
 	check(replacement.Lease != lease.Lease, "lease token reused")
+	// The replacement has an empty destination table. Fill it with distinct
+	// authenticated first contacts, then prove the next tuple cannot be used.
+	time.Sleep(time.Second)
+	capacityPeers := make([]*net.UDPConn, 0, 129)
+	defer func() {
+		for _, peer := range capacityPeers {
+			peer.Close()
+		}
+	}()
+	for index := 0; index < 129; index++ {
+		peer, listenErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+		must(listenErr)
+		capacityPeers = append(capacityPeers, peer)
+		contact := gateway.Datagram{Lease: replacement.Lease, Generation: 2,
+			Remote: peer.LocalAddr().(*net.UDPAddr).AddrPort(), Payload: []byte("destination bound")}
+		send(udp, contact, uint64(600+index), false, -1)
+		if index < 128 {
+			peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, source, readErr := peer.ReadFromUDPAddrPort(buffer)
+			must(readErr)
+			check(source == netip.MustParseAddrPort(replacement.Endpoint) &&
+				bytes.Equal(buffer[:n], contact.Payload), "bounded first-contact destination lost")
+		} else {
+			expectNoUDP(peer)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	statsResponse = control.request(gateway.Request{Method: "stats"})
+	check(statsResponse.Error == "" && statsResponse.Datagrams != nil &&
+		statsResponse.Datagrams.PolicyDrops > stats.PolicyDrops,
+		"destination table did not reject the 129th tuple")
+	stats = *statsResponse.Datagrams
+	evidence["datagramStats"] = stats
+	evidence["boundedDestinationsPerGeneration"] = 128
+	for _, peer := range capacityPeers {
+		peer.Close()
+	}
+	capacityPeers = nil
 	expectClosed(firstWork)
 	expectClosed(secondWork)
 	firstPeer.Close()

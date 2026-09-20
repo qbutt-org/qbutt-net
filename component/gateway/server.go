@@ -92,6 +92,9 @@ type lease struct {
 
 const ephemeralLeaseAttempts = 16
 
+const maxUDPDestinations = 128
+const udpDestinationTTL = 30 * time.Second
+
 type peer struct {
 	incoming net.Conn
 	work     net.Conn
@@ -810,14 +813,19 @@ func (s *Server) serveQUIC(conn *quic.Conn) {
 		if status != ReassemblyComplete {
 			continue
 		}
+		packet.Remote = netip.AddrPortFrom(packet.Remote.Addr().Unmap(), packet.Remote.Port())
 		s.mu.Lock()
 		current := owner.leases[packet.Lease]
-		valid := current != nil && current.active && current.udp != nil && current.info.Generation == packet.Generation && time.Now().Before(current.deadline) && time.Since(current.remote[packet.Remote]) < 30*time.Second
+		now := time.Now()
+		valid := current != nil && current.active && current.udp != nil && current.info.Generation == packet.Generation && now.Before(current.deadline) && current.validRemote(packet.Remote)
 		if !valid {
 			s.stats.PolicyDrops++
 		} else if allowed, packetLimited := s.allowDatagram(len(packet.Payload)); !allowed {
 			valid = false
 			s.recordRateDrop(packetLimited)
+		} else if !current.rememberRemote(packet.Remote, now) {
+			valid = false
+			s.stats.PolicyDrops++
 		}
 		s.mu.Unlock()
 		if valid {
@@ -865,6 +873,38 @@ func (s *Server) recordRateDrop(packetLimited bool) {
 	}
 }
 
+// A public listener must not turn an authenticated tenant into a way to reach
+// local or private services. Loopback listeners are reserved for controlled labs.
+func (current *lease) validRemote(remote netip.AddrPort) bool {
+	if !remote.IsValid() || remote.Port() == 0 {
+		return false
+	}
+	address := remote.Addr().Unmap()
+	listener := current.udp.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Unmap()
+	if address.Zone() != "" || address.Is4() != listener.Is4() {
+		return false
+	}
+	if listener.IsLoopback() {
+		return address.IsLoopback()
+	}
+	return address.IsGlobalUnicast() && !address.IsPrivate() && address != listener
+}
+
+// Called under the server lock; both directions share one exact-destination
+// bound for this lease and generation.
+func (current *lease) rememberRemote(remote netip.AddrPort, now time.Time) bool {
+	for peer, seen := range current.remote {
+		if now.Sub(seen) >= udpDestinationTTL {
+			delete(current.remote, peer)
+		}
+	}
+	if _, exists := current.remote[remote]; !exists && len(current.remote) >= maxUDPDestinations {
+		return false
+	}
+	current.remote[remote] = now
+	return true
+}
+
 func (current *lease) readUDP() {
 	s := current.owner.server
 	defer s.wg.Done()
@@ -879,25 +919,17 @@ func (current *lease) readUDP() {
 		remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
 		s.mu.Lock()
 		conn := current.owner.udp
-		valid := size <= MaxDatagramPayload && current.active && time.Now().Before(current.deadline) && conn != nil
-		if valid {
-			now := time.Now()
-			for peer, seen := range current.remote {
-				if now.Sub(seen) >= 30*time.Second {
-					delete(current.remote, peer)
-				}
-			}
-			if _, exists := current.remote[remote]; !exists && len(current.remote) >= 128 {
-				valid = false
-			} else {
-				current.remote[remote] = now
-			}
-		}
+		now := time.Now()
+		valid := size <= MaxDatagramPayload && current.active && now.Before(current.deadline) &&
+			conn != nil && current.validRemote(remote)
 		if !valid {
 			s.stats.PolicyDrops++
 		} else if allowed, packetLimited := s.allowDatagram(size); !allowed {
 			valid = false
 			s.recordRateDrop(packetLimited)
+		} else if !current.rememberRemote(remote, now) {
+			valid = false
+			s.stats.PolicyDrops++
 		}
 		current.owner.nextMessage++
 		if current.owner.nextMessage == 0 {
