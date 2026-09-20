@@ -227,6 +227,91 @@ func expectNoUDP(conn *net.UDPConn) {
 	check(ok && timeout.Timeout(), "rejected UDP packet escaped")
 }
 
+// Exercise the public-listener branch with owned local aliases. Invalid
+// destinations must be rejected before a UDP write, while an allowed peer
+// receives a packet from the exact leased socket.
+func checkPublicDestinationGuard(executable, root, configPath string, config map[string]any, tlsConfig *tls.Config, quicConfig *qtls.Config, listenerIP, peerIP string) map[string]any {
+	listener := netip.MustParseAddr(listenerIP)
+	peer := netip.MustParseAddr(peerIP)
+	check(listener.Is4() && peer.Is4() && !listener.IsLoopback() && !peer.IsLoopback() && listener != peer, "distinct IPv4 public lab aliases required")
+	phases := []struct {
+		bind, advertise string
+		denied          []string
+		peer            bool
+	}{
+		{listenerIP, listenerIP, []string{"100.64.1.1:12345", "198.18.0.1:12345", "192.0.0.11:12345", "192.0.2.1:12345", "[::ffff:10.1.2.3]:12345", net.JoinHostPort(listenerIP, "12345")}, true},
+		{"0.0.0.0", listenerIP, []string{"100.64.1.1:12345", net.JoinHostPort(listenerIP, "12345")}, true},
+		{"::", "::1", []string{"[2001:db8::1]:12345", "[3fff::1]:12345", "[2001:2::1]:12345"}, false},
+	}
+	result := map[string]any{}
+	for index, phase := range phases {
+		func() {
+			probe, err := net.Listen("tcp", net.JoinHostPort(phase.bind, "0"))
+			must(err)
+			port := probe.Addr().(*net.TCPAddr).Port
+			udpProbe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(phase.bind), Port: port})
+			must(probe.Close())
+			must(err)
+			must(udpProbe.Close())
+			config["listenerIP"] = phase.bind
+			config["advertiseIP"] = phase.advertise
+			config["allowedPorts"] = []int{port}
+			encoded, err := json.Marshal(config)
+			must(err)
+			must(os.WriteFile(configPath, encoded, 0600))
+			process := startGateway(executable, configPath, filepath.Join(root, fmt.Sprintf("public-%d.log", index)))
+			defer process.stop()
+			control := connect(process.ready.Control, tlsConfig)
+			defer control.conn.Close()
+			udp := udpChannel(process.ready.Datagrams, quicConfig, control.session)
+			defer udp.CloseWithError(0, "fixture_done")
+			acquired := control.request(gateway.Request{Method: "acquire", Path: "public-guard", Generation: 1, Port: uint16(port), TCP: true, UDP: true, TTLSeconds: 20})
+			check(acquired.Error == "" && acquired.Lease != nil, "public guard acquire: "+acquired.Error)
+			lease := *acquired.Lease
+			for message, target := range phase.denied {
+				send(udp, gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: netip.MustParseAddrPort(target), Payload: []byte("must not leave public socket")}, uint64(message+1), false, -1)
+			}
+			var stats gateway.DatagramStats
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				response := control.request(gateway.Request{Method: "stats"})
+				check(response.Error == "" && response.Datagrams != nil, "public guard diagnostics unavailable")
+				stats = *response.Datagrams
+				if stats.PolicyDrops >= uint64(len(phase.denied)) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			check(stats.PolicyDrops == uint64(len(phase.denied)) && stats.ToPublicPackets == 0, "special destination escaped public guard before UDP write")
+			if phase.peer {
+				remote, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(peerIP)})
+				must(err)
+				defer remote.Close()
+				payload := []byte("public destination allowed")
+				send(udp, gateway.Datagram{Lease: lease.Lease, Generation: 1, Remote: remote.LocalAddr().(*net.UDPAddr).AddrPort(), Payload: payload}, 100, false, -1)
+				remote.SetReadDeadline(time.Now().Add(2 * time.Second))
+				var buffer [128]byte
+				n, source, err := remote.ReadFromUDPAddrPort(buffer[:])
+				if err != nil {
+					response := control.request(gateway.Request{Method: "stats"})
+					panic(fmt.Sprintf("public peer receive failed for %s: %v; datagrams=%+v", phase.bind, err, response.Datagrams))
+				}
+				endpoint := netip.MustParseAddrPort(lease.Endpoint)
+				validSource := source == endpoint
+				if phase.bind == "0.0.0.0" {
+					// A wildcard bind owns the port; the OS chooses its source IP.
+					validSource = source.Port() == endpoint.Port()
+				}
+				check(validSource && bytes.Equal(buffer[:n], payload), "public destination lost leased source identity")
+				response := control.request(gateway.Request{Method: "stats"})
+				check(response.Error == "" && response.Datagrams != nil && response.Datagrams.ToPublicPackets == 1, "allowed public datagram not counted")
+			}
+			result[phase.bind] = len(phase.denied)
+		}()
+	}
+	return result
+}
+
 type readyInfo struct {
 	Ready     bool   `json:"ready"`
 	Control   string `json:"control"`
@@ -658,6 +743,13 @@ func run() (evidence map[string]any) {
 	restarted.conn.Close()
 	evidence["actualProcessRestartClearsState"] = true
 	evidence["controlReconnectPreservesDiagnostics"] = true
+	publicListener, publicPeer := os.Getenv("QBUTT_GATEWAY_LAB_PUBLIC_LISTENER"), os.Getenv("QBUTT_GATEWAY_LAB_PUBLIC_PEER")
+	check((publicListener == "") == (publicPeer == ""), "both public lab aliases required")
+	if publicListener != "" {
+		process.stop()
+		process = nil
+		evidence["publicDestinationGuard"] = checkPublicDestinationGuard(os.Args[1], root, configPath, config, tlsConfig, quicConfig, publicListener, publicPeer)
+	}
 	evidence["status"] = "passed"
 	return evidence
 }

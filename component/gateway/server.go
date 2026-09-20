@@ -38,6 +38,7 @@ type Config struct {
 
 type Server struct {
 	config      Config
+	advertiseIP netip.Addr
 	control     net.Listener
 	datagrams   *quic.Listener
 	ctx         context.Context
@@ -113,6 +114,8 @@ func New(config Config, tlsConfig *tls.Config, datagramTLS *qtls.Config) (*Serve
 	if err != nil || advertiseErr != nil || bind.IsMulticast() || advertise.IsUnspecified() || advertise.IsMulticast() || len(config.AllowedPorts) == 0 || len(config.AllowedPorts) > 256 {
 		return nil, errors.New("invalid_listener_acl")
 	}
+	config.ListenerIP = bind.Unmap().String()
+	config.AdvertiseIP = advertise.Unmap().String()
 	for _, port := range config.AllowedPorts {
 		if port == 0 && !bind.IsLoopback() {
 			return nil, errors.New("ephemeral_requires_loopback")
@@ -147,7 +150,7 @@ func New(config Config, tlsConfig *tls.Config, datagramTLS *qtls.Config) (*Serve
 		return nil, errors.New("datagram_listen_failed")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{config: config, control: control, datagrams: udp, ctx: ctx, cancel: cancel,
+	s := &Server{config: config, advertiseIP: advertise.Unmap(), control: control, datagrams: udp, ctx: ctx, cancel: cancel,
 		sessions: make(map[string]*session), connections: make(map[net.Conn]struct{}),
 		rate: datagramRate{updated: time.Now(), packetTokens: float64(config.MaxUDPPacketsPerSecond), byteTokens: float64(config.MaxUDPBytesPerSecond)}}
 	s.wg.Add(3)
@@ -467,6 +470,10 @@ func (owner *session) acquire(request Request) (*LeaseInfo, string) {
 }
 
 func listenLease(listenerIP string, requestedPort uint16, tcpEnabled, udpEnabled bool) (net.Listener, *net.UDPConn, uint16) {
+	family := "6"
+	if netip.MustParseAddr(listenerIP).Unmap().Is4() {
+		family = "4"
+	}
 	attempts := 1
 	if requestedPort == 0 && tcpEnabled && udpEnabled {
 		attempts = ephemeralLeaseAttempts
@@ -477,15 +484,15 @@ func listenLease(listenerIP string, requestedPort uint16, tcpEnabled, udpEnabled
 		if tcpEnabled {
 			address := net.JoinHostPort(listenerIP, strconv.Itoa(int(port)))
 			var err error
-			tcpListener, err = net.Listen("tcp", address)
+			tcpListener, err = net.Listen("tcp"+family, address)
 			if err != nil {
 				return nil, nil, 0
 			}
 			port = uint16(tcpListener.Addr().(*net.TCPAddr).Port)
 		}
 		if udpEnabled {
-			udpAddress, _ := net.ResolveUDPAddr("udp", net.JoinHostPort(listenerIP, strconv.Itoa(int(port))))
-			udpListener, err := net.ListenUDP("udp", udpAddress)
+			udpAddress, _ := net.ResolveUDPAddr("udp"+family, net.JoinHostPort(listenerIP, strconv.Itoa(int(port))))
+			udpListener, err := net.ListenUDP("udp"+family, udpAddress)
 			if err != nil {
 				if tcpListener != nil {
 					tcpListener.Close()
@@ -873,8 +880,35 @@ func (s *Server) recordRateDrop(packetLimited bool) {
 	}
 }
 
+// Reject known non-global or deprecated special-purpose destinations. The
+// 192.0.0.0/24 exceptions below are globally reachable anycast addresses.
+// https://www.iana.org/assignments/iana-ipv4-special-registry
+// https://www.iana.org/assignments/iana-ipv6-special-registry
+var nonPublicUDPDestinations = [...]netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
+	netip.MustParsePrefix("2001:2::/48"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+}
+
+var ietfIPv4Assignments = netip.MustParsePrefix("192.0.0.0/24")
+var publicIPv4Anycast = [...]netip.Addr{
+	netip.MustParseAddr("192.0.0.9"),
+	netip.MustParseAddr("192.0.0.10"),
+}
+
 // A public listener must not turn an authenticated tenant into a way to reach
-// local or private services. Loopback listeners are reserved for controlled labs.
+// known non-public services. Loopback listeners are reserved for controlled labs.
 func (current *lease) validRemote(remote netip.AddrPort) bool {
 	if !remote.IsValid() || remote.Port() == 0 {
 		return false
@@ -887,7 +921,18 @@ func (current *lease) validRemote(remote netip.AddrPort) bool {
 	if listener.IsLoopback() {
 		return address.IsLoopback()
 	}
-	return address.IsGlobalUnicast() && !address.IsPrivate() && address != listener
+	if !address.IsGlobalUnicast() || address.IsPrivate() || address == listener || address == current.owner.server.advertiseIP {
+		return false
+	}
+	if ietfIPv4Assignments.Contains(address) && address != publicIPv4Anycast[0] && address != publicIPv4Anycast[1] {
+		return false
+	}
+	for _, prefix := range nonPublicUDPDestinations {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
 }
 
 // Called under the server lock; both directions share one exact-destination
