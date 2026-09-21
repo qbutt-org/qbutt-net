@@ -11,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	mierulog "github.com/enfein/mieru/v3/pkg/log"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	protocolVersion  = 5
+	protocolVersion  = 6
 	maxFrameBytes    = 65536
 	upstreamRevision = "d3ec342d441b086ec4318332f59dd05d8a2b5697"
 )
@@ -29,9 +30,11 @@ type request struct {
 	Method             string          `json:"method"`
 	ConfigPath         string          `json:"configPath"`
 	ProxyName          string          `json:"proxyName"`
+	ReserveNames       []string        `json:"reserveNames"`
 	ConfiguredServerID string          `json:"configuredServerId"`
 	PathID             string          `json:"pathId"`
 	Generation         uint64          `json:"generation"`
+	NextGeneration     uint64          `json:"nextGeneration"`
 	InterfaceName      string          `json:"interfaceName"`
 	DNS                *dnsPolicy      `json:"dns"`
 	Host               string          `json:"host"`
@@ -164,7 +167,7 @@ func run() error {
 			entries := make([]pathStatus, 0, len(ids))
 			for _, id := range ids {
 				p := paths[id]
-				entries = append(entries, pathStatus{PathID: id, Generation: p.generation, Wire: p.wire.snapshot()})
+				entries = append(entries, pathStatus{PathID: id, Generation: p.generation, Wire: p.wire.snapshot(), Transport: p.transportStatus()})
 			}
 			reply.Result = map[string]any{"paths": entries}
 		case req.Method == "open":
@@ -187,6 +190,31 @@ func run() error {
 			}
 			paths[req.PathID] = p
 			reply.Result = p.endpoint(req)
+		case req.Method == "transport.replace":
+			p, exists := paths[req.PathID]
+			if !exists || p.generation != req.Generation || req.NextGeneration <= req.Generation || req.NextGeneration > 9007199254740991 {
+				reply.Error = failure("generation_mismatch")
+				break
+			}
+			replacement, candidates, err := p.replacementRequest(req)
+			// The parent revokes the old generation before asking for replacement.
+			// A rejected or failed replacement must leave just this path closed.
+			p.close()
+			delete(paths, req.PathID)
+			if err != nil {
+				reply.Error = err
+				break
+			}
+			// Open the validated snapshot, not a second file read that could race
+			// a configuration edit between validation and adapter construction.
+			next, err := openSelectedPath(replacement, candidates)
+			if err != nil {
+				reply.Error = failure("transport_open_failed")
+				break
+			}
+			next.health.lastProbe = time.Now()
+			paths[req.PathID] = next
+			reply.Result = next.endpoint(replacement)
 		case req.Method == "resolveNative":
 			addresses, err := resolveNative(req)
 			if err != nil {
@@ -210,6 +238,7 @@ func run() error {
 			}
 			addresses, err := p.resolver.lookup(p.ctx, req.Host, req.Family)
 			if err != nil {
+				p.transportDialResult(transportTCP, err)
 				reply.Error = failure("path_dns_failed")
 				break
 			}

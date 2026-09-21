@@ -94,11 +94,7 @@ func readProxies(filename string) ([]map[string]any, *controlError) {
 	return document.Proxies, nil
 }
 
-func selectedProxy(req request) (map[string]any, *controlError) {
-	proxies, err := readProxies(req.ConfigPath)
-	if err != nil {
-		return nil, err
-	}
+func selectedProxy(req request, proxies []map[string]any) (map[string]any, *controlError) {
 	for _, proxy := range proxies {
 		if proxy["name"] != req.ProxyName {
 			continue

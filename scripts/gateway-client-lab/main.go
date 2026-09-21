@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	parentProtocol        = 5
+	parentProtocol        = 6
 	effectiveSOCKSPayload = 65485
 )
 
@@ -499,7 +499,10 @@ func decodeStatus(response frame) []pathStatus {
 	for index, rawPath := range rawPaths {
 		var fields map[string]json.RawMessage
 		must(json.Unmarshal(rawPath, &fields))
-		check(len(fields) == 3 && fields["pathId"] != nil && fields["generation"] != nil && fields["wire"] != nil, "path status fields mismatch")
+		check(len(fields) == 4 && fields["pathId"] != nil && fields["generation"] != nil && fields["wire"] != nil && fields["transport"] != nil, "path status fields mismatch")
+		var transport map[string]string
+		must(json.Unmarshal(fields["transport"], &transport))
+		check(len(transport) == 2 && transport["state"] == "disabled" && transport["recommended"] == "", "unexpected transport health without reserves")
 		var wireFields map[string]json.RawMessage
 		must(json.Unmarshal(fields["wire"], &wireFields))
 		for _, name := range []string{"relayDownloadBytes", "relayUploadBytes", "carrierDownloadBytes", "carrierUploadBytes", "carrierDownloadPackets", "carrierUploadPackets", "relayDownloadCopies"} {
@@ -804,9 +807,10 @@ func run() (evidence map[string]any) {
 		check(child.stderr.Len() == 0, "qbutt-net emitted stderr")
 	}()
 	check(errorCode(child.requestVersion(4, "hello", nil)) == "protocol_mismatch", "legacy v4 handshake admitted")
+	check(errorCode(child.requestVersion(5, "hello", nil)) == "protocol_mismatch", "legacy v5 handshake admitted")
 	evidence["legacyProtocolRejected"] = true
 	hello := child.request("hello", nil)
-	check(hello.Error == nil, "v5 hello failed")
+	check(hello.Error == nil, "v6 hello failed")
 	listed := child.request("list", map[string]any{"configPath": profilePath, "proxyName": "selected"})
 	check(listed.Error == nil, "selected list failed")
 	var identities struct {
@@ -1084,7 +1088,7 @@ func run() (evidence map[string]any) {
 	evidence["parentEOFCleanup"] = true
 
 	shutdownChild := startChild(os.Args[1])
-	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v5 hello failed")
+	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v6 hello failed")
 	shutdownPathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "shutdown-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	decodePathEndpoint(shutdownChild.request("open", shutdownPathFields))
@@ -1119,7 +1123,7 @@ func run() (evidence map[string]any) {
 		}
 		check(failureChild.stderr.Len() == 0, "failure qbutt-net emitted stderr")
 	}()
-	check(failureChild.request("hello", nil).Error == nil, "failure v5 hello failed")
+	check(failureChild.request("hello", nil).Error == nil, "failure v6 hello failed")
 	failurePathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "failure-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	failurePath := decodePathEndpoint(failureChild.request("open", failurePathFields))

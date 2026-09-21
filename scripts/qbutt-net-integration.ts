@@ -107,7 +107,7 @@ function launch() {
   lines.on("line", line => {
     assert(Buffer.byteLength(line) < 65536);
     const reply = JSON.parse(line);
-    assert.equal(reply.v, 5);
+    assert.equal(reply.v, 6);
     const receive = replies.get(reply.id);
     assert(receive, "response id must match a request");
     replies.delete(reply.id);
@@ -123,7 +123,7 @@ function launch() {
     request(method: string, params: Record<string, unknown> = {}) {
       const requestId = ++id;
       const reply = deadline(new Promise<any>(resolve => replies.set(requestId, resolve)), method);
-      child.stdin.write(JSON.stringify({ v: 5, id: requestId, method, ...params }) + "\n");
+      child.stdin.write(JSON.stringify({ v: 6, id: requestId, method, ...params }) + "\n");
       return reply;
     },
   };
@@ -164,8 +164,9 @@ try {
   assert.equal((await child.request("list", { configPath })).error.code, "hello_required");
   assert.equal((await child.request("hello", { v: 1 })).error.code, "protocol_mismatch");
   assert.equal((await child.request("hello", { v: 4 })).error.code, "protocol_mismatch");
+  assert.equal((await child.request("hello", { v: 5 })).error.code, "protocol_mismatch");
   const hello = (await child.request("hello")).result;
-  assert.equal(hello.protocol, 5);
+  assert.equal(hello.protocol, 6);
   assert.equal(hello.upstreamRevision, "d3ec342d441b086ec4318332f59dd05d8a2b5697");
   assert.deepEqual((await child.request("status")).result, { paths: [] });
   const listed = (await child.request("list", { configPath })).result.proxies;
@@ -229,7 +230,8 @@ try {
   assert.equal(endpoint.capabilities.publicUdp, "unknown");
   const zeroWire = { relayDownloadBytes: 0, relayUploadBytes: 0, carrierDownloadBytes: 0, carrierUploadBytes: 0,
     carrierDownloadPackets: 0, carrierUploadPackets: 0, relayDownloadCopies: 0 };
-  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 1, wire: zeroWire }] });
+  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 1,
+    transport: { state: "disabled", recommended: "" }, wire: zeroWire }] });
   assert.equal((await child.request("open", parameters)).error.code, "path_exists");
   const noAuth = await connect(endpoint);
   noAuth.socket.write(Buffer.from([5, 1, 0]));
@@ -261,7 +263,8 @@ try {
     udpClient.send(packet, relayPort, "127.0.0.1");
     assert.deepEqual(await received, packet);
   } finally { udpClient.close(); }
-  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 1, wire: {
+  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 1,
+    transport: { state: "disabled", recommended: "" }, wire: {
     ...zeroWire, relayDownloadBytes: payload.length * 2 + 1024, relayUploadBytes: payload.length * 2 + 1024,
     relayDownloadCopies: 1,
   } }] });
@@ -275,7 +278,8 @@ try {
   const pending = await openTCP(endpoint2);
   pending.socket.write(payload);
   assert.deepEqual(await pending.read(payload.length), payload);
-  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 2, wire: {
+  assert.deepEqual((await child.request("status")).result, { paths: [{ pathId: "fixture", generation: 2,
+    transport: { state: "disabled", recommended: "" }, wire: {
     ...zeroWire, relayDownloadBytes: payload.length, relayUploadBytes: payload.length,
   } }] });
   child.child.stdin.end();

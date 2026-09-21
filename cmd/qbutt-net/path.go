@@ -44,6 +44,9 @@ type path struct {
 	wire                   wireCounters
 	closing                bool
 	wg                     sync.WaitGroup
+	openRequest            request
+	transports             []transportCandidate
+	health                 transportHealth
 }
 
 type udpAssociation struct {
@@ -119,16 +122,47 @@ func (association *udpAssociation) setRemote(remote C.PacketConn) bool {
 }
 
 func openPath(req request) (*path, *controlError) {
+	candidates, err := selectedTransports(req)
+	if err != nil {
+		return nil, err
+	}
+	return openSelectedPath(req, candidates)
+}
+
+func openSelectedPath(req request, candidates []transportCandidate) (*path, *controlError) {
+	p, err := newPath(req, candidates[0].mapping)
+	if err != nil {
+		return nil, err
+	}
+	p.openRequest = req
+	p.transports = candidates
+	listener, listenErr := net.Listen("tcp4", "127.0.0.1:0")
+	if listenErr != nil {
+		p.close()
+		return nil, failure("listener_failed")
+	}
+	p.listener = listener
+	var secret [32]byte
+	if _, randomErr := rand.Read(secret[:]); randomErr != nil {
+		p.close()
+		return nil, failure("credentials_failed")
+	}
+	p.username = hex.EncodeToString(secret[:8])
+	p.password = hex.EncodeToString(secret[8:])
+	p.wg.Add(1)
+	go p.accept()
+	return p, nil
+}
+
+// Adapter construction is shared with bounded reserve reachability probes.
+// A probe owns its sockets but never exposes a local payload listener.
+func newPath(req request, mapping map[string]any) (*path, *controlError) {
 	if !validLabel(req.InterfaceName) {
 		return nil, failure("interface_required")
 	}
 	iface, err := net.InterfaceByName(req.InterfaceName)
 	if err != nil || iface.Flags&net.FlagUp == 0 {
 		return nil, failure("interface_unavailable")
-	}
-	mapping, importErr := selectedProxy(req)
-	if importErr != nil {
-		return nil, importErr
 	}
 	identity := configuredServerID(mapping)
 	if identity == "" {
@@ -176,21 +210,7 @@ func openPath(req request) (*path, *controlError) {
 	if err != nil {
 		return nil, failure("adapter_rejected")
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		proxy.Close()
-		return nil, failure("listener_failed")
-	}
-	var secret [32]byte
-	if _, err := rand.Read(secret[:]); err != nil {
-		listener.Close()
-		proxy.Close()
-		return nil, failure("credentials_failed")
-	}
 	p.proxy = proxy
-	p.listener = listener
-	p.username = hex.EncodeToString(secret[:8])
-	p.password = hex.EncodeToString(secret[8:])
 	p.resolver = &pathResolver{owner: p, server: dnsAddress, family: req.DNS.Family,
 		dial: func(ctx context.Context, address string) (net.Conn, error) {
 			metadata := &C.Metadata{NetWork: C.TCP, Type: C.SOCKS5}
@@ -200,8 +220,6 @@ func openPath(req request) (*path, *controlError) {
 			return p.proxy.DialContext(ctx, metadata)
 		}}
 	opened = true
-	p.wg.Add(1)
-	go p.accept()
 	return p, nil
 }
 
@@ -252,7 +270,9 @@ func (p *path) close() {
 	p.mu.Lock()
 	p.closing = true
 	p.cancel()
-	p.listener.Close()
+	if p.listener != nil {
+		p.listener.Close()
+	}
 	gateway := p.gateway
 	if gateway != nil {
 		gateway.parentClose.Store(true)
@@ -470,12 +490,14 @@ func (p *path) serve(c net.Conn) {
 		}
 		ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
 		if err := p.resolveMetadata(ctx, metadata); err != nil {
+			p.transportDialResult(transportTCP, err)
 			cancel()
 			replySOCKS(c, byte(socks5.ErrHostUnreachable), nil)
 			return
 		}
 		remote, err := p.proxy.DialContext(ctx, metadata)
 		cancel()
+		p.transportDialResult(transportTCP, err)
 		if err != nil {
 			replySOCKS(c, byte(socks5.ErrHostUnreachable), nil)
 			return
@@ -488,9 +510,13 @@ func (p *path) serve(c net.Conn) {
 			return
 		}
 		c.SetDeadline(time.Time{})
-		local := newCountedConn(c, nil, &p.wire.relayDownloadBytes)
-		outbound := newCountedConn(remote, nil, &p.wire.relayUploadBytes)
+		local := newCountedConn(c, nil, &p.wire.relayDownloadBytes, &p.health.flows[transportTCP].download)
+		outbound := newCountedConn(remote, nil, &p.wire.relayUploadBytes, &p.health.flows[transportTCP].upload)
+		before := p.health.flows[transportTCP].download.value.Load()
 		N.Relay(local, outbound)
+		if p.health.flows[transportTCP].download.value.Load() == before {
+			p.transportDialResult(transportTCP, io.EOF)
+		}
 	case socks5.CmdUDPAssociate:
 		if !p.proxy.SupportUDP() {
 			replySOCKS(c, byte(socks5.ErrCommandNotSupported), nil)
@@ -555,6 +581,7 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 	var remote C.PacketConn
 	var readDone chan struct{}
 	defer func() {
+		association.cancel()
 		if remote != nil {
 			p.release(remote)
 			<-readDone
@@ -591,6 +618,7 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 			return
 		}
 		if err = p.resolveMetadata(association.ctx, metadata); err != nil {
+			p.transportDialResult(transportUDP, err)
 			association.endDirect()
 			continue
 		}
@@ -598,6 +626,7 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 			ctx, cancel := context.WithTimeout(association.ctx, 20*time.Second)
 			remote, err = p.proxy.ListenPacketContext(ctx, metadata)
 			cancel()
+			p.transportDialResult(transportUDP, err)
 			if err != nil {
 				association.endDirect()
 				return
@@ -620,6 +649,9 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 				for {
 					n, source, err := remote.ReadFrom(incoming)
 					if err != nil {
+						if association.ctx.Err() == nil {
+							p.transportDialResult(transportUDP, err)
+						}
 						local.Close()
 						return
 					}
@@ -631,13 +663,16 @@ func (p *path) serveUDP(c net.Conn, requested socks5.Addr) {
 						return
 					}
 					p.wire.relayDownloadBytes.add(n)
+					p.health.flows[transportUDP].download.add(n)
 					p.wire.relayDownloadCopies.increment()
 				}
 			}()
 		}
 		written, err := remote.WriteTo(payload, metadata.UDPAddr())
 		p.wire.relayUploadBytes.add(written)
+		p.health.flows[transportUDP].upload.add(written)
 		if err != nil {
+			p.transportDialResult(transportUDP, err)
 			association.endDirect()
 			return
 		}

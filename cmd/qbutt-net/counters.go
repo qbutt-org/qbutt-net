@@ -71,13 +71,15 @@ func (counters *wireCounters) snapshot() wireSnapshot {
 	}
 }
 
-func newCountedConn(conn net.Conn, read, write *monotonicCounter) net.Conn {
+func newCountedConn(conn net.Conn, read *monotonicCounter, writes ...*monotonicCounter) net.Conn {
 	var readCounters, writeCounters []N.CountFunc
 	if read != nil {
 		readCounters = []N.CountFunc{read.count}
 	}
-	if write != nil {
-		writeCounters = []N.CountFunc{write.count}
+	for _, write := range writes {
+		if write != nil {
+			writeCounters = append(writeCounters, write.count)
+		}
 	}
 	return S.NewCounterConn(conn, readCounters, writeCounters)
 }
@@ -109,7 +111,8 @@ func (conn *countedPacketConn) WriteTo(buffer []byte, address net.Addr) (int, er
 }
 
 type pathStatus struct {
-	PathID     string       `json:"pathId"`
-	Generation uint64       `json:"generation"`
-	Wire       wireSnapshot `json:"wire"`
+	PathID     string          `json:"pathId"`
+	Generation uint64          `json:"generation"`
+	Wire       wireSnapshot    `json:"wire"`
+	Transport  transportStatus `json:"transport"`
 }
