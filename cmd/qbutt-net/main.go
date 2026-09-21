@@ -19,27 +19,29 @@ import (
 )
 
 const (
-	protocolVersion  = 6
+	protocolVersion  = 7
 	maxFrameBytes    = 65536
 	upstreamRevision = "d3ec342d441b086ec4318332f59dd05d8a2b5697"
 )
 
 type request struct {
-	Version            int             `json:"v"`
-	ID                 uint64          `json:"id"`
-	Method             string          `json:"method"`
-	ConfigPath         string          `json:"configPath"`
-	ProxyName          string          `json:"proxyName"`
-	ReserveNames       []string        `json:"reserveNames"`
-	ConfiguredServerID string          `json:"configuredServerId"`
-	PathID             string          `json:"pathId"`
-	Generation         uint64          `json:"generation"`
-	NextGeneration     uint64          `json:"nextGeneration"`
-	InterfaceName      string          `json:"interfaceName"`
-	DNS                *dnsPolicy      `json:"dns"`
-	Host               string          `json:"host"`
-	Family             string          `json:"family"`
-	Gateway            *gatewayOptions `json:"gateway"`
+	Version            int               `json:"v"`
+	ID                 uint64            `json:"id"`
+	Method             string            `json:"method"`
+	ConfigPath         string            `json:"configPath"`
+	ProxyName          string            `json:"proxyName"`
+	ProxyNames         []string          `json:"proxyNames"`
+	ReserveNames       []string          `json:"reserveNames"`
+	ReserveServerIDs   map[string]string `json:"reserveServerIds"`
+	ConfiguredServerID string            `json:"configuredServerId"`
+	PathID             string            `json:"pathId"`
+	Generation         uint64            `json:"generation"`
+	NextGeneration     uint64            `json:"nextGeneration"`
+	InterfaceName      string            `json:"interfaceName"`
+	DNS                *dnsPolicy        `json:"dns"`
+	Host               string            `json:"host"`
+	Family             string            `json:"family"`
+	Gateway            *gatewayOptions   `json:"gateway"`
 }
 
 type response struct {
@@ -134,6 +136,24 @@ func run() error {
 		case !hello:
 			reply.Error = failure("hello_required")
 		case req.Method == "list":
+			selected := make(map[string]bool)
+			if len(req.ProxyNames) > 4 || (len(req.ProxyNames) > 0 && req.ProxyName != "") {
+				reply.Error = failure("invalid_transport_selection")
+				break
+			}
+			for _, name := range req.ProxyNames {
+				if !validLabel(name) || selected[name] {
+					reply.Error = failure("invalid_transport_selection")
+					break
+				}
+				selected[name] = true
+			}
+			if reply.Error != nil {
+				break
+			}
+			if req.ProxyName != "" {
+				selected[req.ProxyName] = true
+			}
 			proxies, err := readProxies(req.ConfigPath)
 			if err != nil {
 				reply.Error = err
@@ -141,18 +161,18 @@ func run() error {
 			}
 			entries := make([]map[string]string, 0, len(proxies))
 			for _, proxy := range proxies {
-				if req.ProxyName != "" && proxy["name"] != req.ProxyName {
+				if len(selected) > 0 && !selected[proxy["name"].(string)] {
 					continue
 				}
 				identity := configuredServerID(proxy)
-				if req.ProxyName != "" && identity == "" {
+				if len(selected) > 0 && identity == "" {
 					reply.Error = failure("invalid_configured_server")
 					break
 				}
 				entries = append(entries, map[string]string{"name": proxy["name"].(string), "type": proxy["type"].(string), "configuredServerId": identity})
 			}
 			if reply.Error == nil {
-				if req.ProxyName != "" && len(entries) == 0 {
+				if len(selected) > 0 && len(entries) != len(selected) {
 					reply.Error = failure("proxy_not_found")
 				} else {
 					reply.Result = map[string]any{"proxies": entries}

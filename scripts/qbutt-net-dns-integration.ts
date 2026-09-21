@@ -31,7 +31,7 @@ class Wire {
   constructor(readonly socket: Socket) {
     sockets.add(socket); socket.on("close", () => { sockets.delete(socket); this.ended = true; this.waiting?.(); });
     socket.on("error", () => { this.ended = true; this.waiting?.(); });
-    socket.on("data", data => { this.buffer = Buffer.concat([this.buffer, data]); assert(this.buffer.length < 131072); this.waiting?.(); });
+    socket.on("data", (data: Buffer) => { this.buffer = Buffer.concat([this.buffer, data]); assert(this.buffer.length < 131072); this.waiting?.(); });
   }
   async read(count: number): Promise<Buffer> {
     while (this.buffer.length < count) {
@@ -61,7 +61,7 @@ async function dnsReply(wire: Wire, path: string, lastByte: number) {
   cursor++; const type = data.readUInt16BE(cursor); cursor += 4;
   const host = labels.join("."); queries.push({ path, host, type });
   if (host === "slow.test") return;
-  const valid = path === "bootstrap" ? ["edge-a.test", "edge-a-target.test", "edge-b.test"].includes(host) :
+  const valid = path === "bootstrap" ? ["edge-a.test", "edge-a-target.test", "edge-a-alias.test", "edge-b.test"].includes(host) :
     ["same.test", "localhost", "udp.test", "family.test", "cache.test", "fresh.test", "bounds.test", "wrong-id.test", "truncated.test", "no-cache.test", "cname.test", "cycle.test", "expires.test"].includes(host);
   const header = Buffer.from(data.subarray(0, 12)); header.writeUInt16BE(valid ? 0x8180 : 0x8183, 2);
   const count = valid ? (host === "bounds.test" ? 65 : 1) : 0;
@@ -133,11 +133,11 @@ for (const [name, lastByte] of [["a", 2], ["b", 3]] as const) {
 const child = spawn(binary, ["--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
 let stderr = ""; child.stderr.on("data", data => { stderr += data; });
 const pending = new Map<number, (reply: any) => void>(); let requestID = 0;
-createInterface({ input: child.stdout }).on("line", line => { const reply = JSON.parse(line); assert.equal(reply.v, 6); pending.get(reply.id)?.(reply); pending.delete(reply.id); });
+createInterface({ input: child.stdout }).on("line", line => { const reply = JSON.parse(line); assert.equal(reply.v, 7); pending.get(reply.id)?.(reply); pending.delete(reply.id); });
 const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
 function request(method: string, fields: object = {}) {
   const id = ++requestID; const promise = deadline(new Promise<any>(resolve => pending.set(id, resolve)), method);
-  child.stdin.write(JSON.stringify({ v: 6, id, method, ...fields }) + "\n"); return promise;
+  child.stdin.write(JSON.stringify({ v: 7, id, method, ...fields }) + "\n"); return promise;
 }
 async function authenticate(endpoint: any) {
   const socket = createConnection(endpoint.port, endpoint.host); const wire = new Wire(socket);
@@ -157,8 +157,9 @@ const configPath = join(temporary, "subscription.json");
 try {
   await writeFile(configPath, JSON.stringify({ dns: { enable: true, nameserver: [`127.0.0.1:${(rogue.address() as any).port}`] }, hosts: { "same.test": "127.0.0.99" },
     proxies: [...upstreams.map(item => ({ name: item.name, type: "socks5", server: `edge-${item.name}.test`, port: item.port, udp: true, tls: true, "skip-cert-verify": true })),
+      { name: "a-alias", type: "socks5", server: "edge-a-alias.test", port: upstreams[0]!.port, udp: true, tls: true, "skip-cert-verify": true },
       { name: "g", type: "gost-relay", server: "127.0.0.1", port: (blackhole.address() as any).port, udp: true }] }));
-  assert.equal((await request("hello")).result.protocol, 6);
+  assert.equal((await request("hello")).result.protocol, 7);
   const native = { pathId: "native", generation: 1, interfaceName: nativeInterface,
     dns: { server: nativeDNSAddress, bootstrapServer: nativeDNSAddress, family: "dual" },
     host: "same.test", family: "dual" };
@@ -239,6 +240,23 @@ try {
   assert(queries.filter(query => query.path === "bootstrap").every(query => /^edge-(a(-target)?|b)\.test$/.test(query.host)), "Torrent names escaped to bootstrap");
   assert(sni.length > 0 && sni.every(host => ["edge-a.test", "edge-b.test"].includes(host)), "TLS server hostname was replaced during bootstrap");
   assert.equal(rogueConnections, 0, "Imported DNS policy was executed");
+  const alias = (await request("open", { ...params("a"), pathId: "alias", reserveNames: ["a-alias"],
+    reserveServerIds: { "a-alias": identities.get("a-alias") } })).result;
+  assert(alias);
+  await tcp(alias, "same.test");
+  const beforeAliasSni = sni.length;
+  const replacement = (await request("transport.replace", { pathId: "alias", generation: 1, nextGeneration: 2, proxyName: "a-alias" })).result;
+  assert(replacement && replacement.configuredServerId === identities.get("a-alias"));
+  await tcp(replacement, "same.test");
+  assert(sni.length > beforeAliasSni && sni.slice(beforeAliasSni).every(host => host === "edge-a-alias.test"),
+    "Alias replacement rewrote the adapter's original TLS server name");
+  assert(queries.some(query => query.path === "bootstrap" && query.host === "edge-a-alias.test"), "Alias server hostname was not bootstrapped");
+  const beforeReturnSni = sni.length;
+  const returned = (await request("transport.replace", { pathId: "alias", generation: 2, nextGeneration: 3, proxyName: "a" })).result;
+  assert(returned && returned.configuredServerId === identities.get("a"));
+  await tcp(returned, "same.test");
+  assert(sni.length > beforeReturnSni && sni.slice(beforeReturnSni).every(host => host === "edge-a.test"));
+  assert.deepEqual((await request("close", { pathId: "alias", generation: 3 })).result, {});
   assert((await request("open", params("g"))).result);
   const handshakeStart = Date.now();
   assert.equal((await request("resolve", { pathId: "g", generation: 1, host: "same.test", family: "ipv4" })).error.code, "path_dns_failed");
@@ -278,7 +296,7 @@ try {
   console.log(JSON.stringify({ passed: true, queries: queries.length, tcpVerifiedBytes, udpVerifiedBytes,
     nativeDNS: { boundAddressVerified: true, nonLoopbackInterface: nativeInterface !== interfaceName,
       ephemeralGeneration: true, noSystemFallback: true, validationAndTimeout: true },
-    checks: ["explicit v6 DNS policy", "two-path independent A/AAAA", "TLS server hostname preserved", "numeric IPv4/IPv6 TCP and UDP destinations", "SOCKS unspecified UDP bind bootstrap", "UDP TTL cache, TTL zero and expiry", "bootstrap/destination CNAME and cycle rejection", "localhost resolved through path", "family and generation guards", "NXDOMAIN no fallback", "malformed/truncated/over-limit DNS rejected", "imported rogue DNS unused", "GOST handshake timeout and TCP/UDP close", "pending DNS cancelled by close", "generation cache isolation", "EOF bounded during resolver timeout"] }));
+    checks: ["explicit v7 DNS policy", "two-path independent A/AAAA", "TLS server hostname preserved", "explicit DNS aliases replace both ways with original server/SNI", "numeric IPv4/IPv6 TCP and UDP destinations", "SOCKS unspecified UDP bind bootstrap", "UDP TTL cache, TTL zero and expiry", "bootstrap/destination CNAME and cycle rejection", "localhost resolved through path", "family and generation guards", "NXDOMAIN no fallback", "malformed/truncated/over-limit DNS rejected", "imported rogue DNS unused", "GOST handshake timeout and TCP/UDP close", "pending DNS cancelled by close", "generation cache isolation", "EOF bounded during resolver timeout"] }));
 } finally {
   if (child.exitCode === null) child.kill();
   for (const socket of sockets) socket.destroy();

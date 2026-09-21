@@ -56,6 +56,9 @@ func selectedTransports(req request) ([]transportCandidate, *controlError) {
 	if len(req.ReserveNames) > 3 {
 		return nil, failure("transport_limit")
 	}
+	if len(req.ReserveServerIDs) != len(req.ReserveNames) {
+		return nil, failure("invalid_transport_selection")
+	}
 	proxies, readErr := readProxies(req.ConfigPath)
 	if readErr != nil {
 		return nil, readErr
@@ -70,14 +73,17 @@ func selectedTransports(req request) ([]transportCandidate, *controlError) {
 		seen[name] = true
 		selected := req
 		selected.ProxyName = name
+		if name != req.ProxyName {
+			selected.ConfiguredServerID = req.ReserveServerIDs[name]
+		}
 		mapping, err := selectedProxy(selected, proxies)
 		if err != nil {
 			return nil, err
 		}
-		if req.ConfiguredServerID == "" {
+		if selected.ConfiguredServerID == "" {
 			return nil, failure("configured_server_id_required")
 		}
-		if configuredServerID(mapping) != req.ConfiguredServerID {
+		if configuredServerID(mapping) != selected.ConfiguredServerID {
 			return nil, failure("server_identity_changed")
 		}
 		encoded, encodeErr := json.Marshal(mapping)
@@ -118,12 +124,15 @@ func (p *path) replacementRequest(req request) (request, []transportCandidate, *
 	next.Generation = req.NextGeneration
 	next.ProxyName = req.ProxyName
 	next.ReserveNames = nil
+	next.ReserveServerIDs = make(map[string]string)
 	ordered := make([]transportCandidate, 1, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.name == next.ProxyName {
 			ordered[0] = candidate
+			next.ConfiguredServerID = configuredServerID(candidate.mapping)
 		} else {
 			next.ReserveNames = append(next.ReserveNames, candidate.name)
+			next.ReserveServerIDs[candidate.name] = configuredServerID(candidate.mapping)
 			ordered = append(ordered, candidate)
 		}
 	}
@@ -254,6 +263,7 @@ func (p *path) checkTransports(protocol transportProtocol, startDownloaded uint6
 				}
 				req := p.openRequest
 				req.ProxyName = candidate.name
+				req.ConfiguredServerID = req.ReserveServerIDs[candidate.name]
 				probe, err := newPath(req, candidate.mapping)
 				if err != nil {
 					continue

@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	parentProtocol        = 6
+	parentProtocol        = 7
 	effectiveSOCKSPayload = 65485
 )
 
@@ -808,9 +808,10 @@ func run() (evidence map[string]any) {
 	}()
 	check(errorCode(child.requestVersion(4, "hello", nil)) == "protocol_mismatch", "legacy v4 handshake admitted")
 	check(errorCode(child.requestVersion(5, "hello", nil)) == "protocol_mismatch", "legacy v5 handshake admitted")
+	check(errorCode(child.requestVersion(6, "hello", nil)) == "protocol_mismatch", "legacy v6 handshake admitted")
 	evidence["legacyProtocolRejected"] = true
 	hello := child.request("hello", nil)
-	check(hello.Error == nil, "v6 hello failed")
+	check(hello.Error == nil, "v7 hello failed")
 	listed := child.request("list", map[string]any{"configPath": profilePath, "proxyName": "selected"})
 	check(listed.Error == nil, "selected list failed")
 	var identities struct {
@@ -1088,7 +1089,7 @@ func run() (evidence map[string]any) {
 	evidence["parentEOFCleanup"] = true
 
 	shutdownChild := startChild(os.Args[1])
-	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v6 hello failed")
+	check(shutdownChild.request("hello", nil).Error == nil, "shutdown v7 hello failed")
 	shutdownPathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "shutdown-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	decodePathEndpoint(shutdownChild.request("open", shutdownPathFields))
@@ -1123,7 +1124,7 @@ func run() (evidence map[string]any) {
 		}
 		check(failureChild.stderr.Len() == 0, "failure qbutt-net emitted stderr")
 	}()
-	check(failureChild.request("hello", nil).Error == nil, "failure v6 hello failed")
+	check(failureChild.request("hello", nil).Error == nil, "failure v7 hello failed")
 	failurePathFields := map[string]any{"configPath": profilePath, "proxyName": "selected", "configuredServerId": configuredServerID, "pathId": "failure-path", "generation": 1,
 		"interfaceName": loopbackInterface(), "dns": map[string]any{"server": dnsAddress, "bootstrapServer": dnsAddress, "family": "ipv4"}}
 	failurePath := decodePathEndpoint(failureChild.request("open", failurePathFields))

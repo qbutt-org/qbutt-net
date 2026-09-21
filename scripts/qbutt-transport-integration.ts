@@ -14,7 +14,7 @@ const interfaceName = process.argv[3] ?? Object.entries(networkInterfaces())
 assert(interfaceName, "Pass the loopback interface name as argument 2");
 const root = await mkdtemp(join(tmpdir(), "qbutt-transport-reserves-"));
 const sockets = new Set<Socket>();
-const evidence: Record<string, unknown> = { status: "running", checks: [], protocol: 6,
+const evidence: Record<string, unknown> = { status: "running", checks: [], protocol: 7,
     binarySha256: createHash("sha256").update(new Uint8Array(await Bun.file(binary).arrayBuffer())).digest("hex") };
 const checks = evidence.checks as string[];
 const DNS_PORT = 10653;
@@ -34,7 +34,7 @@ class Wire {
     private ended = false;
     constructor(readonly socket: Socket) {
         sockets.add(socket);
-        socket.on("data", data => {
+        socket.on("data", (data: Buffer) => {
             this.buffer = Buffer.concat([this.buffer, data]);
             assert(this.buffer.length <= 1024 * 1024);
             this.wake?.();
@@ -126,7 +126,7 @@ async function upstream(host = "127.0.0.1") {
 }
 
 const primary = await upstream();
-const reserve = await upstream();
+const reserve = await upstream("127.0.0.3");
 const independent = await upstream("127.0.0.2");
 const child = spawn(binary, ["--stdio"], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
 let stderr = "";
@@ -145,7 +145,7 @@ let nextId = 0;
 async function rpc(method: string, fields: Record<string, unknown> = {}) {
     const id = ++nextId;
     const result = bounded(new Promise<any>(resolve => pending.set(id, resolve)));
-    child.stdin.write(JSON.stringify({ v: 6, id, method, ...fields }) + "\n");
+    child.stdin.write(JSON.stringify({ v: 7, id, method, ...fields }) + "\n");
     return result;
 }
 async function status(pathId: string) {
@@ -185,24 +185,28 @@ async function echo(wire: Wire) {
 }
 
 try {
-    assert.equal((await rpc("hello")).result.protocol, 6);
+    assert.equal((await rpc("hello")).result.protocol, 7);
     const configPath = join(root, "nodes.json");
     const proxies = [primary, reserve, independent].map((server, index) => ({ name: ["primary", "reserve", "other"][index],
         type: "socks5", server: server.host, port: server.port, udp: true }));
     await writeFile(configPath, JSON.stringify({ proxies }));
     const identity = (server: string) => createHash("sha256").update(`qbutt-configured-server-v1\0${server}`).digest("hex");
     const input = { configPath, proxyName: "primary", reserveNames: ["reserve"], configuredServerId: identity(primary.host),
+        reserveServerIds: { reserve: identity(reserve.host) },
         pathId: "primary", generation: 1, interfaceName, dns: { server: `127.0.0.1:${DNS_PORT}`, bootstrapServer: `127.0.0.1:${DNS_PORT}`, family: "ipv4" } };
-    assert.equal((await rpc("open", { ...input, reserveNames: ["other"] })).error.code, "server_identity_changed");
+    assert.equal((await rpc("open", { ...input, reserveNames: ["other"], reserveServerIds: { other: identity(primary.host) } })).error.code,
+        "server_identity_changed");
+    assert.equal((await rpc("open", { ...input, reserveServerIds: {} })).error.code, "invalid_transport_selection");
+    assert.equal((await rpc("open", { ...input, reserveServerIds: { reserve: identity(primary.host) } })).error.code, "server_identity_changed");
     assert.equal((await rpc("open", { ...input, reserveNames: ["reserve", "reserve"] })).error.code, "invalid_transport_selection");
     const first = (await rpc("open", input)).result;
     assert(first);
     const other = (await rpc("open", { ...input, pathId: "other", generation: 7, proxyName: "other",
-        configuredServerId: identity(independent.host), reserveNames: [] })).result;
+        configuredServerId: identity(independent.host), reserveNames: [], reserveServerIds: {} })).result;
     const healthy = await connect(other);
     assert.equal(healthy.code, 0);
     await echo(healthy.wire);
-    checks.push("explicit-same-server-reserves-only");
+    checks.push("explicit-reserves-with-each-configured-server-independently-validated");
 
     const idleTcp = await connect(first);
     await echo(idleTcp.wire);
@@ -283,7 +287,8 @@ try {
     const replaced = await rpc("transport.replace", { pathId: "primary", generation: 1, nextGeneration: 2, proxyName: "reserve" });
     assert(!replaced.error, "Reserve replacement failed");
     assert.equal(replaced.result.generation, 2);
-    assert.equal(replaced.result.configuredServerId, first.configuredServerId);
+    assert.equal(replaced.result.configuredServerId, identity(reserve.host));
+    assert.notEqual(replaced.result.configuredServerId, first.configuredServerId);
     assert.notEqual(replaced.result.socksPassword, first.socksPassword);
     await until(async () => association.wire.socket.destroyed);
     await until(async () => currentTcp.wire.socket.destroyed);
@@ -299,7 +304,13 @@ try {
     assert.equal((await status("other")).generation, 7);
     assert.equal((await rpc("transport.replace", { pathId: "primary", generation: 1, nextGeneration: 3, proxyName: "primary" })).error.code, "generation_mismatch");
     throughReserve.wire.socket.destroy();
-    assert(!(await rpc("close", { pathId: "primary", generation: 2 })).error);
+    const returned = await rpc("transport.replace", { pathId: "primary", generation: 2, nextGeneration: 3, proxyName: "primary" });
+    assert(!returned.error);
+    assert.equal(returned.result.configuredServerId, identity(primary.host));
+    const throughOriginal = await connect(returned.result);
+    await echo(throughOriginal.wire);
+    throughOriginal.wire.socket.destroy();
+    assert(!(await rpc("close", { pathId: "primary", generation: 3 })).error);
     checks.push("same-edge-new-generation-exact-payload-and-unaffected-other-connection");
     checks.push("one-way-udp-blackhole-with-continuing-outbound-and-healthy-concurrent-tcp");
 
@@ -351,7 +362,7 @@ try {
     stillHealthyTcp.wire.socket.destroy();
     checks.push("udp-resolver-unreachable-on-all-reserves-without-rotation-or-self-triggered-probe-loop");
 
-    proxies[1].port++;
+    proxies[1].server = "127.0.0.4";
     await writeFile(configPath, JSON.stringify({ proxies }));
     assert.equal((await rpc("transport.replace", { pathId: "unavailable", generation: 10, nextGeneration: 11, proxyName: "reserve" })).error.code,
         "transport_config_changed");
@@ -360,7 +371,7 @@ try {
     await echo(healthy.wire);
     checks.push("changed-selected-config-rejected-before-replacement");
 
-    proxies[1].port--;
+    proxies[1].server = reserve.host;
     await writeFile(configPath, JSON.stringify({ proxies }));
     const cancelled = (await rpc("open", { ...input, pathId: "cancelled", generation: 20 })).result;
     const cancelledUdp = await connect(cancelled, 0, 3);

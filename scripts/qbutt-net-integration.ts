@@ -26,7 +26,7 @@ class Wire {
   private waiting?: () => void;
   private ended = false;
   constructor(readonly socket: Socket) {
-    socket.on("data", data => {
+    socket.on("data", (data: Buffer) => {
       this.buffer = Buffer.concat([this.buffer, data]);
       assert(this.buffer.length < 2 * 1024 * 1024, "fixture receive limit");
       this.waiting?.();
@@ -107,7 +107,7 @@ function launch() {
   lines.on("line", line => {
     assert(Buffer.byteLength(line) < 65536);
     const reply = JSON.parse(line);
-    assert.equal(reply.v, 6);
+    assert.equal(reply.v, 7);
     const receive = replies.get(reply.id);
     assert(receive, "response id must match a request");
     replies.delete(reply.id);
@@ -123,7 +123,7 @@ function launch() {
     request(method: string, params: Record<string, unknown> = {}) {
       const requestId = ++id;
       const reply = deadline(new Promise<any>(resolve => replies.set(requestId, resolve)), method);
-      child.stdin.write(JSON.stringify({ v: 6, id: requestId, method, ...params }) + "\n");
+      child.stdin.write(JSON.stringify({ v: 7, id: requestId, method, ...params }) + "\n");
       return reply;
     },
   };
@@ -165,8 +165,9 @@ try {
   assert.equal((await child.request("hello", { v: 1 })).error.code, "protocol_mismatch");
   assert.equal((await child.request("hello", { v: 4 })).error.code, "protocol_mismatch");
   assert.equal((await child.request("hello", { v: 5 })).error.code, "protocol_mismatch");
+  assert.equal((await child.request("hello", { v: 6 })).error.code, "protocol_mismatch");
   const hello = (await child.request("hello")).result;
-  assert.equal(hello.protocol, 6);
+  assert.equal(hello.protocol, 7);
   assert.equal(hello.upstreamRevision, "d3ec342d441b086ec4318332f59dd05d8a2b5697");
   assert.deepEqual((await child.request("status")).result, { paths: [] });
   const listed = (await child.request("list", { configPath })).result.proxies;
@@ -184,8 +185,15 @@ try {
   assert.equal((await child.request("list", { configPath: boundedConfig })).result.proxies.length, 326);
   await writeFile(boundedConfig, JSON.stringify({ proxies: Array.from({length: 1025}, (_, index) => ({name: `node-${index}`, type: "socks5"})) }));
   assert.equal((await child.request("list", { configPath: boundedConfig })).error.code, "proxy_limit");
-  await writeFile(boundedConfig, JSON.stringify({ proxies: Array.from({length: 1024}, (_, index) => ({name: `${index}-${"n".repeat(120)}`, type: "socks5"})) }));
+  const longNames = Array.from({length: 1024}, (_, index) => `${index}-${"n".repeat(120)}`);
+  await writeFile(boundedConfig, JSON.stringify({ proxies: longNames.map(name => ({name, type: "socks5", server: "127.0.0.1", port: upstreamPort})) }));
   assert.equal((await child.request("list", { configPath: boundedConfig })).error.code, "response_limit");
+  const selectedNames = longNames.slice(-4);
+  const boundedSelection = (await child.request("list", { configPath: boundedConfig, proxyNames: selectedNames })).result.proxies;
+  assert.deepEqual(boundedSelection.map((node: { name: string }) => node.name), selectedNames);
+  assert.equal((await child.request("list", { configPath: boundedConfig, proxyNames: [...selectedNames, selectedNames[0]] })).error.code, "invalid_transport_selection");
+  assert.equal((await child.request("list", { configPath: boundedConfig, proxyNames: [selectedNames[0], selectedNames[0]] })).error.code, "invalid_transport_selection");
+  assert.equal((await child.request("list", { configPath: boundedConfig, proxyNames: ["absent"] })).error.code, "proxy_not_found");
   await writeFile(boundedConfig, "x".repeat(2 * 1024 * 1024 + 1));
   assert.equal((await child.request("list", { configPath: boundedConfig })).error.code, "config_limit");
   const parameters = { configPath, configuredServerId, proxyName: "selected", pathId: "fixture", generation: 1, interfaceName,
