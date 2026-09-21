@@ -362,7 +362,7 @@ try {
     stillHealthyTcp.wire.socket.destroy();
     checks.push("udp-resolver-unreachable-on-all-reserves-without-rotation-or-self-triggered-probe-loop");
 
-    proxies[1].server = "127.0.0.4";
+    proxies[1].port++;
     await writeFile(configPath, JSON.stringify({ proxies }));
     assert.equal((await rpc("transport.replace", { pathId: "unavailable", generation: 10, nextGeneration: 11, proxyName: "reserve" })).error.code,
         "transport_config_changed");
@@ -371,7 +371,7 @@ try {
     await echo(healthy.wire);
     checks.push("changed-selected-config-rejected-before-replacement");
 
-    proxies[1].server = reserve.host;
+    proxies[1].port--;
     await writeFile(configPath, JSON.stringify({ proxies }));
     const cancelled = (await rpc("open", { ...input, pathId: "cancelled", generation: 20 })).result;
     const cancelledUdp = await connect(cancelled, 0, 3);
