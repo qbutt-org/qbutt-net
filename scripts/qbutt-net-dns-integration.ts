@@ -130,7 +130,7 @@ for (const [name, lastByte] of [["a", 2], ["b", 3]] as const) {
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   upstreams.push({ server, udp, name, port: (server.address() as any).port });
 }
-const child = spawn(binary, ["--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
+const child = spawn(binary, ["--stdio"], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
 let stderr = ""; child.stderr.on("data", data => { stderr += data; });
 const pending = new Map<number, (reply: any) => void>(); let requestID = 0;
 createInterface({ input: child.stdout }).on("line", line => { const reply = JSON.parse(line); assert.equal(reply.v, 7); pending.get(reply.id)?.(reply); pending.delete(reply.id); });

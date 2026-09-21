@@ -99,7 +99,7 @@ await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
 const upstreamPort = (upstream.address() as {port: number}).port;
 
 function launch() {
-  const child = spawn(binary, ["--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(binary, ["--stdio"], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", data => { stderr += data; assert(stderr.length < 4096); });
   const replies = new Map<number, (reply: any) => void>();
