@@ -530,8 +530,8 @@ func (p *path) serve(c net.Conn) {
 
 func replySOCKS(c net.Conn, status byte, addr net.Addr) bool {
 	encoded := socks5.ParseAddrToSocksAddr(addr)
-	if encoded == nil {
-		encoded = socks5.ParseAddr("127.0.0.1:0")
+	if encoded == nil || (encoded[0] == socks5.AtypDomainName && encoded[1] == 0) {
+		encoded = socks5.ParseAddr("0.0.0.0:0")
 	}
 	_, err := c.Write(append([]byte{5, status, 0}, encoded...))
 	return err == nil

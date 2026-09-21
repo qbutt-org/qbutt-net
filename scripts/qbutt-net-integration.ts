@@ -50,6 +50,7 @@ class Wire {
     if (type[0] === 4) return Buffer.concat([type, await this.read(18)]);
     assert.equal(type[0], 3);
     const length = await this.read(1);
+    assert(length[0] > 0, "SOCKS reply must not contain an empty domain");
     return Buffer.concat([type, length, await this.read(length[0] + 2)]);
   }
 }
